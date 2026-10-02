@@ -25,9 +25,9 @@
 //! the 32-bit range a reference decoder works in, so what it writes decodes
 //! identically everywhere.
 
-use super::bits::{BitReader, BitWriter};
-use super::sign_extend;
-use crate::audio::AudioError;
+use crate::bits::{BitReader, BitWriter};
+use crate::pcm::sign_extend;
+use crate::Error;
 
 /// Element tags in a frame.
 pub const ID_SCE: u32 = 0;
@@ -56,7 +56,7 @@ const N_MAX_MEAN_CLAMP: u32 = 0xFFFF;
 
 /// `ALACSpecificConfig`, the 24-byte magic cookie.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlacConfig {
+pub struct Config {
     pub frame_length: u32,
     pub compatible_version: u8,
     pub bit_depth: u8,
@@ -70,7 +70,7 @@ pub struct AlacConfig {
     pub sample_rate: u32,
 }
 
-impl AlacConfig {
+impl Config {
     pub const LEN: usize = 24;
 
     /// A cookie for the given stream, with the default coding parameters.
@@ -94,7 +94,7 @@ impl AlacConfig {
     /// bytes, the 28-byte `alac` FullBox body (version and flags first), a
     /// whole `alac` atom (size + `alac` + version/flags + config), or a
     /// QuickTime `wave` atom holding one.
-    pub fn parse(extra: &[u8]) -> Result<Self, AudioError> {
+    pub fn parse(extra: &[u8]) -> Result<Self, Error> {
         let config = if extra.len() == Self::LEN {
             extra
         } else if extra.len() == Self::LEN + 4 && extra[..4] == [0, 0, 0, 0] {
@@ -103,10 +103,10 @@ impl AlacConfig {
             // `alac` atom: 4-byte size before the type, 4 bytes of
             // version/flags after it.
             extra.get(i + 8..i + 8 + Self::LEN).ok_or_else(|| {
-                AudioError::Decode("alac: magic cookie truncated after its atom header".into())
+                Error::Invalid("alac: magic cookie truncated after its atom header".into())
             })?
         } else {
-            return Err(AudioError::Decode(format!(
+            return Err(Error::Invalid(format!(
                 "alac: {}-byte codec configuration is not an ALACSpecificConfig",
                 extra.len()
             )));
@@ -126,22 +126,22 @@ impl AlacConfig {
             sample_rate: be32(20),
         };
         if c.compatible_version != 0 {
-            return Err(AudioError::Unsupported(format!(
+            return Err(Error::Unsupported(format!(
                 "alac: magic cookie compatible version {}",
                 c.compatible_version
             )));
         }
         if !matches!(c.bit_depth, 16 | 20 | 24 | 32) {
-            return Err(AudioError::Unsupported(format!("alac: bit depth {}", c.bit_depth)));
+            return Err(Error::Unsupported(format!("alac: bit depth {}", c.bit_depth)));
         }
         if !(1..=8).contains(&c.num_channels) {
-            return Err(AudioError::Unsupported(format!("alac: {} channels", c.num_channels)));
+            return Err(Error::Unsupported(format!("alac: {} channels", c.num_channels)));
         }
         if c.frame_length == 0 || c.frame_length > 1 << 16 {
-            return Err(AudioError::Decode(format!("alac: frame length {}", c.frame_length)));
+            return Err(Error::Invalid(format!("alac: frame length {}", c.frame_length)));
         }
         if c.kb == 0 || c.kb > 31 {
-            return Err(AudioError::Decode(format!("alac: Rice limit {}", c.kb)));
+            return Err(Error::Invalid(format!("alac: Rice limit {}", c.kb)));
         }
         Ok(c)
     }
@@ -183,7 +183,7 @@ pub fn element_layout(channels: u8) -> &'static [(u32, usize)] {
     }
 }
 
-/// For each pipeline (native-order) channel, the ALAC channel it is. The
+/// For each native-order channel, the ALAC channel it is. The
 /// native layouts these land on: 3.0 FL FR FC; 4.0 FL FR FC BC; 5.0 FL FR FC
 /// BL BR; 5.1 FL FR FC LFE BL BR; 6.1 FL FR FC LFE BC SL SR; and for eight
 /// channels 7.1(wide) FL FR FC LFE BL BR FLC FRC, ALAC's Lc and Rc being
@@ -214,7 +214,7 @@ pub struct RiceParams {
 }
 
 impl RiceParams {
-    pub fn new(config: &AlacConfig, pb_factor: u32) -> Self {
+    pub fn new(config: &Config, pb_factor: u32) -> Self {
         Self {
             pb: u32::from(config.pb) * pb_factor / 4,
             mb: u32::from(config.mb),
@@ -233,7 +233,7 @@ fn run_k(history: u32) -> u32 {
     history.leading_zeros() - 24 + ((history + 16) >> 6)
 }
 
-fn read_code(br: &mut BitReader<'_>, k: u32, escape_bits: u32) -> Result<u32, AudioError> {
+fn read_code(br: &mut BitReader<'_>, k: u32, escape_bits: u32) -> Result<u32, Error> {
     let prefix = br.read_unary_ones(MAX_PREFIX)?;
     if prefix >= MAX_PREFIX {
         return Ok(br.read(escape_bits)? as u32);
@@ -278,7 +278,7 @@ pub(crate) fn decode_residuals(
     p: &RiceParams,
     n: usize,
     sample_bits: u32,
-) -> Result<Vec<i32>, AudioError> {
+) -> Result<Vec<i32>, Error> {
     let mut out = vec![0i32; n];
     let mut history = p.mb;
     let mut sign_modifier = 0u32;
@@ -300,7 +300,7 @@ pub(crate) fn decode_residuals(
             let k = run_k(history).min(p.kb);
             let run = read_code(br, k, 16)? as usize;
             if run > n - i {
-                return Err(AudioError::Decode(format!(
+                return Err(Error::Invalid(format!(
                     "alac: a run of {run} zeros overruns the block ({} samples left)",
                     n - i
                 )));
@@ -508,21 +508,21 @@ mod tests {
     use super::*;
 
     fn params() -> RiceParams {
-        RiceParams::new(&AlacConfig::new(44_100, 2, 16), 4)
+        RiceParams::new(&Config::new(44_100, 2, 16), 4)
     }
 
     #[test]
     fn cookie_round_trips_in_every_wrapping() {
-        let c = AlacConfig { max_frame_bytes: 9000, avg_bit_rate: 800_000, ..AlacConfig::new(96_000, 6, 24) };
+        let c = Config { max_frame_bytes: 9000, avg_bit_rate: 800_000, ..Config::new(96_000, 6, 24) };
         let bare = c.to_bytes();
-        assert_eq!(AlacConfig::parse(&bare).unwrap(), c);
+        assert_eq!(Config::parse(&bare).unwrap(), c);
         let mut fullbox = vec![0, 0, 0, 0];
         fullbox.extend_from_slice(&bare);
-        assert_eq!(AlacConfig::parse(&fullbox).unwrap(), c);
+        assert_eq!(Config::parse(&fullbox).unwrap(), c);
         let mut atom = 36u32.to_be_bytes().to_vec();
         atom.extend_from_slice(b"alac");
         atom.extend_from_slice(&fullbox);
-        assert_eq!(AlacConfig::parse(&atom).unwrap(), c);
+        assert_eq!(Config::parse(&atom).unwrap(), c);
     }
 
     #[test]

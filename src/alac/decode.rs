@@ -6,26 +6,27 @@
 //! predicted and Rice coded or escaped to raw samples. The magic cookie
 //! (`ALACSpecificConfig`) from the container gives the bit depth (16, 20,
 //! 24 or 32), the channel count (1–8), the frame length and the coder's
-//! parameters. See [`crate::audio::lossless::alac`] for the coding scheme.
+//! parameters. See [`super::format`] for the coding scheme.
 //!
 //! The decoded channels are reordered from ALAC's layouts (which lead with
-//! the centre channel) to the pipeline's native order; see
-//! [`native_from_alac`] for the layout each count lands on.
+//! the centre channel) to the native order of most PCM pipelines; see
+//! [`native_from_alac`] and [`layout`](super::layout) for the layout each
+//! count lands on.
 
-use crate::audio::lossless::alac::{
-    AlacConfig, ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE, RiceParams, decode_residuals,
+use super::format::{
+    Config, ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE, RiceParams, decode_residuals,
     native_from_alac, unpredict,
 };
-use crate::audio::lossless::bits::BitReader;
-use crate::audio::lossless::{ints_to_f32, sign_extend};
-use crate::audio::{AudioDecoder, AudioError, AudioFrame};
+use crate::Error;
+use crate::bits::BitReader;
+use crate::pcm::sign_extend;
 
-fn err(msg: impl Into<String>) -> AudioError {
-    AudioError::Decode(format!("alac: {}", msg.into()))
+fn err(msg: impl Into<String>) -> Error {
+    Error::Invalid(format!("alac: {}", msg.into()))
 }
 
 /// Decode one frame to per-channel samples in ALAC channel order.
-pub fn decode_frame(config: &AlacConfig, packet: &[u8]) -> Result<Vec<Vec<i64>>, AudioError> {
+pub fn decode_frame(config: &Config, packet: &[u8]) -> Result<Vec<Vec<i64>>, Error> {
     let channels = usize::from(config.num_channels);
     let depth = u32::from(config.bit_depth);
     let mut br = BitReader::new(packet, "alac");
@@ -86,7 +87,7 @@ pub fn decode_frame(config: &AlacConfig, packet: &[u8]) -> Result<Vec<Vec<i64>>,
                 }
                 br.skip(count * 8)?;
             }
-            ID_CCE | ID_PCE => return Err(AudioError::Unsupported(format!("alac: element type {tag}"))),
+            ID_CCE | ID_PCE => return Err(Error::Unsupported(format!("alac: element type {tag}"))),
             ID_END => break,
             _ => unreachable!("a 3-bit tag"),
         }
@@ -99,11 +100,11 @@ pub fn decode_frame(config: &AlacConfig, packet: &[u8]) -> Result<Vec<Vec<i64>>,
 
 fn decode_compressed(
     br: &mut BitReader<'_>,
-    config: &AlacConfig,
+    config: &Config,
     nch: usize,
     n: usize,
     shift_bytes: u32,
-) -> Result<Vec<Vec<i64>>, AudioError> {
+) -> Result<Vec<Vec<i64>>, Error> {
     let depth = u32::from(config.bit_depth);
     let shift = shift_bytes * 8;
     if shift >= depth {
@@ -124,7 +125,7 @@ fn decode_compressed(
         let den_shift = br.read_u32(4)?;
         let pb_factor = br.read_u32(3)?;
         let order = br.read_u32(5)? as usize;
-        let coefs = (0..order).map(|_| Ok(br.read_signed(16)? as i16)).collect::<Result<_, AudioError>>()?;
+        let coefs = (0..order).map(|_| Ok(br.read_signed(16)? as i16)).collect::<Result<_, Error>>()?;
         preds.push(Pred { mode, den_shift, pb_factor, coefs });
     }
     // The low bytes, raw and interleaved, come before the residuals.
@@ -179,28 +180,34 @@ fn decode_compressed(
     Ok(chans)
 }
 
-/// ALAC through the [`AudioDecoder`] surface.
-pub struct AlacDecoder {
-    config: AlacConfig,
-    first_pts_us: Option<i64>,
+/// An ALAC stream's decoder: one frame per packet in, interleaved integer
+/// samples out.
+pub struct Decoder {
+    config: Config,
     samples_decoded: u64,
 }
 
-impl AlacDecoder {
+impl Decoder {
     /// `extra_data` is the magic cookie, in any of the wrappings
-    /// [`AlacConfig::parse`] takes; it is required.
-    pub fn new(extra_data: Option<&[u8]>) -> Result<Self, AudioError> {
+    /// [`Config::parse`] takes; it is required.
+    pub fn new(extra_data: Option<&[u8]>) -> Result<Self, Error> {
         let extra = extra_data.filter(|e| !e.is_empty()).ok_or_else(|| err("no magic cookie"))?;
-        Ok(Self { config: AlacConfig::parse(extra)?, first_pts_us: None, samples_decoded: 0 })
+        Ok(Self { config: Config::parse(extra)?, samples_decoded: 0 })
     }
 
-    pub fn config(&self) -> &AlacConfig {
+    /// The magic cookie: bit depth, channel count, rate, frame length.
+    pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Decode one packet to interleaved integer samples in the pipeline's
-    /// channel order, at the cookie's bit depth.
-    pub fn decode_int(&mut self, packet: &[u8]) -> Result<Vec<i32>, AudioError> {
+    /// Samples per channel decoded so far.
+    pub fn samples_decoded(&self) -> u64 {
+        self.samples_decoded
+    }
+
+    /// Decode one packet to interleaved integer samples in native channel
+    /// order ([`layout`](super::layout)), at the cookie's bit depth.
+    pub fn decode_int(&mut self, packet: &[u8]) -> Result<Vec<i32>, Error> {
         let chans = decode_frame(&self.config, packet)?;
         let n = chans.first().map_or(0, Vec::len);
         let order = native_from_alac(self.config.num_channels);
@@ -208,35 +215,5 @@ impl AlacDecoder {
         let out: Vec<i32> = (0..n).flat_map(|i| order.iter().map(move |&c| chans[c][i] as i32)).collect();
         self.samples_decoded += n as u64;
         Ok(out)
-    }
-}
-
-impl AudioDecoder for AlacDecoder {
-    fn decode(&mut self, packet: &[u8], pts: i64) -> Result<Vec<AudioFrame>, AudioError> {
-        let first_pts_us = *self.first_pts_us.get_or_insert(pts);
-        let before = self.samples_decoded;
-        let samples = self.decode_int(packet)?;
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rate = self.config.sample_rate.max(1);
-        Ok(vec![AudioFrame {
-            samples: ints_to_f32(&samples, u32::from(self.config.bit_depth)),
-            sample_rate: rate,
-            channels: self.config.num_channels,
-            pts: first_pts_us + (before as i64 * 1_000_000) / i64::from(rate),
-        }])
-    }
-
-    fn flush(&mut self) -> Result<Vec<AudioFrame>, AudioError> {
-        Ok(Vec::new())
-    }
-
-    /// ALAC's four-channel layout is 4.0 (C L R Cs), not the quad the
-    /// pipeline assumes of four channels. Its eight-channel layout's front
-    /// left- and right-of-centre pair has no label here, and rides in the
-    /// 7.1 slots SL / SR.
-    fn layout(&self) -> Option<crate::audio::filter::ChannelLayout> {
-        (self.config.num_channels == 4).then(|| crate::audio::filter::ChannelLayout::named("4.0"))
     }
 }

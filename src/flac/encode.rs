@@ -12,18 +12,18 @@
 //! (independent, left/side, side/right, mid/side). Low bits that are zero
 //! throughout a block ("wasted bits") are shifted out.
 //!
-//! [`FlacLevel`] trades speed for size: `Fast` stops at the fixed
+//! [`Level`] trades speed for size: `Fast` stops at the fixed
 //! predictors, `Default` adds LPC up to order 8 with the order picked from
 //! the Levinson error estimate, `Best` tries every LPC order to 12 exactly.
 //!
 //! The stream's STREAMINFO — frame size bounds, sample count and the MD5 of
-//! the audio — is complete once [`FlacEncoder::flush`] has run, which is
-//! when a muxer asks for [`AudioEncoder::extra_data`].
+//! the audio — is complete once [`Encoder::finish`] has run, which is when
+//! a muxer should ask for [`Encoder::metadata_blocks`].
 
-use crate::audio::lossless::bits::BitWriter;
-use crate::audio::lossless::flac::{BLOCK_STREAMINFO, StreamInfo, block_header, crc8, crc16, md5_bytes};
-use crate::audio::lossless::{f32_to_int, lpc};
-use crate::audio::{AudioEncoder, AudioEncoderConfig, AudioError, AudioFrame, EncodedAudioPacket};
+use super::format::{BLOCK_STREAMINFO, StreamInfo, block_header, crc8, crc16, md5_bytes};
+use crate::Error;
+use crate::bits::BitWriter;
+use crate::lpc;
 
 #[cfg(test)]
 mod tests;
@@ -33,7 +33,7 @@ pub const BLOCK_SIZE: usize = 4096;
 
 /// Compression effort.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum FlacLevel {
+pub enum Level {
     /// Fixed predictors only, Rice partitions to order 3.
     Fast,
     /// LPC to order 8 (order picked by estimate), partitions to order 6.
@@ -43,7 +43,7 @@ pub enum FlacLevel {
     Best,
 }
 
-impl FlacLevel {
+impl Level {
     fn max_lpc_order(self) -> usize {
         match self {
             Self::Fast => 0,
@@ -63,17 +63,19 @@ impl FlacLevel {
 
 /// What a FLAC encoder is built for.
 #[derive(Clone, Copy, Debug)]
-pub struct FlacEncoderConfig {
+pub struct EncoderConfig {
     pub sample_rate: u32,
-    /// 1–8, in the pipeline's native order (which is FLAC's).
+    /// 1–8, in FLAC's order ([`layout`](super::layout)).
     pub channels: u8,
     /// 4–32.
     pub bits_per_sample: u8,
-    pub level: FlacLevel,
+    pub level: Level,
 }
 
-pub struct FlacEncoder {
-    config: FlacEncoderConfig,
+/// A FLAC stream's encoder: interleaved integer samples in, whole frames
+/// out, and the STREAMINFO that describes them.
+pub struct Encoder {
+    config: EncoderConfig,
     /// Interleaved samples waiting for a whole frame.
     pending: Vec<i32>,
     frames: u64,
@@ -87,16 +89,18 @@ pub struct FlacEncoder {
     md5_digest: Option<[u8; 16]>,
 }
 
-impl FlacEncoder {
-    pub fn new(config: FlacEncoderConfig) -> Result<Self, AudioError> {
+impl Encoder {
+    /// An encoder for `config`; refused (`Error::Unsupported`) outside 1–8
+    /// channels, 4–32 bits or a sample rate of 1 Hz to 2^20 - 1 Hz.
+    pub fn new(config: EncoderConfig) -> Result<Self, Error> {
         if !(1..=8).contains(&config.channels) {
-            return Err(AudioError::Unsupported(format!("flac: {} channels (1–8)", config.channels)));
+            return Err(Error::Unsupported(format!("flac: {} channels (1–8)", config.channels)));
         }
         if !(4..=32).contains(&config.bits_per_sample) {
-            return Err(AudioError::Unsupported(format!("flac: {}-bit samples (4–32)", config.bits_per_sample)));
+            return Err(Error::Unsupported(format!("flac: {}-bit samples (4–32)", config.bits_per_sample)));
         }
         if config.sample_rate == 0 || config.sample_rate >= 1 << 20 {
-            return Err(AudioError::Unsupported(format!("flac: sample rate {} Hz", config.sample_rate)));
+            return Err(Error::Unsupported(format!("flac: sample rate {} Hz", config.sample_rate)));
         }
         Ok(Self {
             config,
@@ -110,6 +114,11 @@ impl FlacEncoder {
             md5_scratch: Vec::new(),
             md5_digest: None,
         })
+    }
+
+    /// What the encoder was built for.
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
     }
 
     /// Encode interleaved integer samples; returns the frames completed, each
@@ -338,7 +347,7 @@ struct RicePlan {
     bits: usize,
 }
 
-fn plan_subframe(x: &[i64], bps: u32, level: FlacLevel) -> SubframePlan {
+fn plan_subframe(x: &[i64], bps: u32, level: Level) -> SubframePlan {
     let n = x.len();
     // Constant: one sample.
     if x.iter().all(|&v| v == x[0]) {
@@ -371,7 +380,7 @@ fn plan_subframe(x: &[i64], bps: u32, level: FlacLevel) -> SubframePlan {
     // Fixed predictors. `Fast` estimates the order from the residual sums;
     // the others price every order exactly.
     let fixed: Vec<(usize, Vec<i64>)> = (0..=4.min(n.saturating_sub(1))).map(|o| (o, fixed_residual(&best.samples, o))).collect();
-    let candidates: Vec<&(usize, Vec<i64>)> = if level == FlacLevel::Fast {
+    let candidates: Vec<&(usize, Vec<i64>)> = if level == Level::Fast {
         fixed
             .iter()
             .min_by_key(|(_, r)| r.iter().map(|v| v.unsigned_abs()).sum::<u64>())
@@ -391,7 +400,7 @@ fn plan_subframe(x: &[i64], bps: u32, level: FlacLevel) -> SubframePlan {
         let r = lpc::autocorrelation(&best.samples, &window, max_order);
         let (coefs, errors) = lpc::levinson(&r, max_order);
         let precision: u32 = if ebps <= 16 { 13 } else { 15 };
-        let orders: Vec<usize> = if level == FlacLevel::Best {
+        let orders: Vec<usize> = if level == Level::Best {
             (1..=coefs.len()).collect()
         } else {
             // The order whose estimated size — residual entropy from the
@@ -413,7 +422,7 @@ fn plan_subframe(x: &[i64], bps: u32, level: FlacLevel) -> SubframePlan {
 }
 
 /// Replace `best` with the predicted form when its residual codes smaller.
-fn consider(best: &mut SubframePlan, kind: SubKind, residual: Vec<i64>, head_bits: usize, level: FlacLevel) {
+fn consider(best: &mut SubframePlan, kind: SubKind, residual: Vec<i64>, head_bits: usize, level: Level) {
     // Residuals a decoder cannot hold in 32 bits are not an option.
     if residual.iter().any(|&r| r.unsigned_abs() >= 1 << 30) {
         return;
@@ -635,78 +644,5 @@ fn write_residual(bw: &mut BitWriter, s: &SubframePlan) {
                 }
             }
         }
-    }
-}
-
-/// FLAC through the [`AudioEncoder`] surface: pipeline f32 samples are
-/// taken at `bits_per_sample` (exactly, for audio that came from integers
-/// of at most that depth).
-pub struct FlacAudioEncoder {
-    inner: FlacEncoder,
-    samples_out: u64,
-}
-
-impl FlacAudioEncoder {
-    pub fn new(config: &AudioEncoderConfig, bits_per_sample: u8, level: FlacLevel) -> Result<Self, AudioError> {
-        Ok(Self {
-            inner: FlacEncoder::new(FlacEncoderConfig {
-                sample_rate: config.sample_rate,
-                channels: config.channels,
-                bits_per_sample,
-                level,
-            })?,
-            samples_out: 0,
-        })
-    }
-
-    fn packets(&mut self, frames: Vec<(Vec<u8>, u32)>) -> Vec<EncodedAudioPacket> {
-        let rate = i64::from(self.inner.config.sample_rate);
-        frames
-            .into_iter()
-            .map(|(data, n)| {
-                let pts = self.samples_out as i64 * 1_000_000 / rate;
-                self.samples_out += u64::from(n);
-                EncodedAudioPacket { data, pts, duration: i64::from(n) }
-            })
-            .collect()
-    }
-}
-
-impl AudioEncoder for FlacAudioEncoder {
-    fn encode(&mut self, frame: &AudioFrame) -> Result<Vec<EncodedAudioPacket>, AudioError> {
-        if frame.channels != self.inner.config.channels {
-            return Err(AudioError::Encode(format!(
-                "flac: a {}-channel frame into a {}-channel encoder",
-                frame.channels, self.inner.config.channels
-            )));
-        }
-        if frame.sample_rate != self.inner.config.sample_rate {
-            return Err(AudioError::Encode(format!(
-                "flac: a {} Hz frame into a {} Hz encoder",
-                frame.sample_rate, self.inner.config.sample_rate
-            )));
-        }
-        let bits = u32::from(self.inner.config.bits_per_sample);
-        let ints: Vec<i32> = frame.samples.iter().map(|&x| f32_to_int(x, bits)).collect();
-        let frames = self.inner.encode_int(&ints);
-        Ok(self.packets(frames))
-    }
-
-    fn flush(&mut self) -> Result<Vec<EncodedAudioPacket>, AudioError> {
-        let frames = self.inner.finish();
-        Ok(self.packets(frames))
-    }
-
-    fn pre_skip(&self) -> u16 {
-        0
-    }
-
-    /// The metadata blocks (STREAMINFO), final once flushed.
-    fn extra_data(&self) -> Vec<u8> {
-        self.inner.metadata_blocks()
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.inner.config.sample_rate
     }
 }

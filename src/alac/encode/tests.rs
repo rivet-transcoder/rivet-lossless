@@ -1,5 +1,5 @@
 use super::*;
-use crate::audio::decode::alac::AlacDecoder;
+use crate::alac::Decoder;
 
 fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
     let full = ((1i64 << (bits - 1)) - 1) as f64;
@@ -29,12 +29,12 @@ fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
 }
 
 fn round_trip(pcm: &[i32], channels: u8, bits: u8) -> usize {
-    let mut enc = AlacEncoder::new(48_000, channels, bits).unwrap();
+    let mut enc = Encoder::new(48_000, channels, bits).unwrap();
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     let cookie = enc.cookie();
     assert!(frames.iter().all(|(f, _)| f.len() as u32 <= cookie.max_frame_bytes));
-    let mut dec = AlacDecoder::new(Some(&cookie.to_bytes())).unwrap();
+    let mut dec = Decoder::new(Some(&cookie.to_bytes())).unwrap();
     let mut got = Vec::new();
     let mut size = 0;
     for (f, n) in &frames {

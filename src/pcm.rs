@@ -1,37 +1,30 @@
-//! What the FLAC and ALAC codecs share: MSB-first bit I/O, linear
-//! prediction analysis, and the conversion between integer PCM and the
-//! pipeline's f32 samples.
+//! Integer PCM and f32 samples, and the sign extension both codecs use.
 //!
-//! # Integer PCM through an f32 pipeline
-//!
-//! The pipeline carries audio as f32 in `[-1.0, 1.0]`. An integer sample of
-//! `bits` bits maps to `s / 2^(bits-1)`, and back by the inverse: a power of
-//! two scale, so the round trip is exact whenever the integer fits the f32
-//! significand — every depth up to 24 bits. A 32-bit source loses its low
-//! bits on the way through; the decoders' integer output
-//! ([`crate::audio::decode::flac::FlacDecoder::decode_int`], …) is exact at
-//! every depth.
+//! The codecs work on integer PCM: the decoders return it and the encoders
+//! take it ([`flac::Decoder::decode_int`](crate::flac::Decoder::decode_int),
+//! [`alac::Encoder::encode_int`](crate::alac::Encoder::encode_int), …), exact
+//! at every depth. A caller whose pipeline carries f32 in `[-1.0, 1.0]` has
+//! these conversions: an integer sample of `bits` bits maps to
+//! `s / 2^(bits-1)`, and back by the inverse — a power of two scale, so the
+//! round trip is exact whenever the integer fits the f32 significand, which
+//! is every depth up to 24 bits. A 32-bit sample loses its low bits on the
+//! way through f32.
 
-pub mod alac;
-pub(crate) mod bits;
-pub mod flac;
-pub(crate) mod lpc;
-
-/// An integer sample of `bits` bits as the pipeline's f32.
-pub(crate) fn int_to_f32(s: i32, bits: u32) -> f32 {
+/// An integer sample of `bits` bits (1–32) as f32 in `[-1.0, 1.0)`.
+pub fn int_to_f32(s: i32, bits: u32) -> f32 {
     (f64::from(s) / (1u64 << (bits - 1)) as f64) as f32
 }
 
-/// A pipeline f32 sample as a `bits`-bit integer: scaled, rounded to the
+/// An f32 sample as a `bits`-bit integer: scaled, rounded to the
 /// nearest, and clipped to the range. Exact inverse of [`int_to_f32`].
-pub(crate) fn f32_to_int(x: f32, bits: u32) -> i32 {
+pub fn f32_to_int(x: f32, bits: u32) -> i32 {
     let scale = (1u64 << (bits - 1)) as f64;
     let max = scale - 1.0;
     (f64::from(x) * scale).round().clamp(-scale, max) as i32
 }
 
-/// Interleaved integer samples as the pipeline's f32.
-pub(crate) fn ints_to_f32(samples: &[i32], bits: u32) -> Vec<f32> {
+/// Integer samples of `bits` bits as f32, by [`int_to_f32`].
+pub fn ints_to_f32(samples: &[i32], bits: u32) -> Vec<f32> {
     samples.iter().map(|&s| int_to_f32(s, bits)).collect()
 }
 

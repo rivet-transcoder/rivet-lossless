@@ -21,12 +21,12 @@
 //! option, and an element with no other goes out escaped, so every frame
 //! decodes the same everywhere.
 
-use crate::audio::lossless::alac::{
-    AlacConfig, ID_END, RiceParams, element_layout, encode_residuals, native_from_alac, predict, residual_bits,
+use super::format::{
+    Config, ID_END, RiceParams, element_layout, encode_residuals, native_from_alac, predict, residual_bits,
 };
-use crate::audio::lossless::bits::BitWriter;
-use crate::audio::lossless::{f32_to_int, lpc};
-use crate::audio::{AudioEncoder, AudioEncoderConfig, AudioError, AudioFrame, EncodedAudioPacket};
+use crate::Error;
+use crate::bits::BitWriter;
+use crate::lpc;
 
 #[cfg(test)]
 mod tests;
@@ -40,30 +40,40 @@ const ORDERS: [usize; 2] = [4, 8];
 /// Pair mixing: the weight is `mix_res / 2^MIX_BITS`.
 const MIX_BITS: u32 = 2;
 
-pub struct AlacEncoder {
-    config: AlacConfig,
+/// An ALAC stream's encoder: interleaved integer samples in, one frame per
+/// packet out, and the magic cookie that describes them.
+pub struct Encoder {
+    config: Config,
     pending: Vec<i32>,
     samples: u64,
     bytes: u64,
 }
 
-impl AlacEncoder {
-    pub fn new(sample_rate: u32, channels: u8, bit_depth: u8) -> Result<Self, AudioError> {
+impl Encoder {
+    /// An encoder of `channels` (1–8) channels at `bit_depth` (16, 20, 24 or
+    /// 32) bits; anything else is refused with `Error::Unsupported`.
+    pub fn new(sample_rate: u32, channels: u8, bit_depth: u8) -> Result<Self, Error> {
         if !(1..=8).contains(&channels) {
-            return Err(AudioError::Unsupported(format!("alac: {channels} channels (1–8)")));
+            return Err(Error::Unsupported(format!("alac: {channels} channels (1–8)")));
         }
         if !matches!(bit_depth, 16 | 20 | 24 | 32) {
-            return Err(AudioError::Unsupported(format!("alac: {bit_depth}-bit samples (16, 20, 24 or 32)")));
+            return Err(Error::Unsupported(format!("alac: {bit_depth}-bit samples (16, 20, 24 or 32)")));
         }
         if sample_rate == 0 {
-            return Err(AudioError::Unsupported("alac: sample rate 0".into()));
+            return Err(Error::Unsupported("alac: sample rate 0".into()));
         }
-        Ok(Self { config: AlacConfig::new(sample_rate, channels, bit_depth), pending: Vec::new(), samples: 0, bytes: 0 })
+        Ok(Self { config: Config::new(sample_rate, channels, bit_depth), pending: Vec::new(), samples: 0, bytes: 0 })
+    }
+
+    /// The cookie as configured: rate, channels, depth, frame length, and the
+    /// largest frame so far (the average bit rate is [`cookie`](Self::cookie)'s).
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// The magic cookie, with the largest frame and the average bit rate
     /// filled in from what has been encoded.
-    pub fn cookie(&self) -> AlacConfig {
+    pub fn cookie(&self) -> Config {
         let mut c = self.config.clone();
         if self.samples > 0 {
             c.avg_bit_rate =
@@ -72,7 +82,8 @@ impl AlacEncoder {
         c
     }
 
-    /// Encode interleaved integer samples in the pipeline's channel order;
+    /// Encode interleaved integer samples in native channel order
+    /// ([`layout`](super::layout));
     /// returns the frames completed, each with its sample count.
     pub fn encode_int(&mut self, samples: &[i32]) -> Vec<(Vec<u8>, u32)> {
         self.pending.extend_from_slice(samples);
@@ -287,64 +298,4 @@ fn seed_coefficients(x: &[i64]) -> Vec<Vec<i16>> {
         out.push(vec![0; ORDERS[0]]);
     }
     out
-}
-
-/// ALAC through the [`AudioEncoder`] surface: pipeline f32 samples are
-/// taken at `bits_per_sample`.
-pub struct AlacAudioEncoder {
-    inner: AlacEncoder,
-    samples_out: u64,
-}
-
-impl AlacAudioEncoder {
-    pub fn new(config: &AudioEncoderConfig, bits_per_sample: u8) -> Result<Self, AudioError> {
-        Ok(Self { inner: AlacEncoder::new(config.sample_rate, config.channels, bits_per_sample)?, samples_out: 0 })
-    }
-
-    fn packets(&mut self, frames: Vec<(Vec<u8>, u32)>) -> Vec<EncodedAudioPacket> {
-        let rate = i64::from(self.inner.config.sample_rate);
-        frames
-            .into_iter()
-            .map(|(data, n)| {
-                let pts = self.samples_out as i64 * 1_000_000 / rate;
-                self.samples_out += u64::from(n);
-                EncodedAudioPacket { data, pts, duration: i64::from(n) }
-            })
-            .collect()
-    }
-}
-
-impl AudioEncoder for AlacAudioEncoder {
-    fn encode(&mut self, frame: &AudioFrame) -> Result<Vec<EncodedAudioPacket>, AudioError> {
-        let cfg = &self.inner.config;
-        if frame.channels != cfg.num_channels || frame.sample_rate != cfg.sample_rate {
-            return Err(AudioError::Encode(format!(
-                "alac: a {}-channel {} Hz frame into a {}-channel {} Hz encoder",
-                frame.channels, frame.sample_rate, cfg.num_channels, cfg.sample_rate
-            )));
-        }
-        let bits = u32::from(cfg.bit_depth);
-        let ints: Vec<i32> = frame.samples.iter().map(|&x| f32_to_int(x, bits)).collect();
-        let frames = self.inner.encode_int(&ints);
-        Ok(self.packets(frames))
-    }
-
-    fn flush(&mut self) -> Result<Vec<EncodedAudioPacket>, AudioError> {
-        let frames = self.inner.finish();
-        Ok(self.packets(frames))
-    }
-
-    fn pre_skip(&self) -> u16 {
-        0
-    }
-
-    /// The 24-byte magic cookie, with its frame-size and bit-rate fields
-    /// final once flushed.
-    fn extra_data(&self) -> Vec<u8> {
-        self.inner.cookie().to_bytes().to_vec()
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.inner.config.sample_rate
-    }
 }

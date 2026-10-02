@@ -4,7 +4,7 @@
 //! Written from the format specification, RFC 9639 ("Free Lossless Audio
 //! Codec"); section numbers below refer to it.
 
-use crate::audio::AudioError;
+use crate::Error;
 
 /// Metadata block types (§8.1).
 pub const BLOCK_STREAMINFO: u8 = 0;
@@ -34,9 +34,9 @@ pub struct StreamInfo {
 impl StreamInfo {
     pub const LEN: usize = 34;
 
-    pub fn parse(b: &[u8]) -> Result<Self, AudioError> {
+    pub fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() < Self::LEN {
-            return Err(AudioError::Decode(format!(
+            return Err(Error::Invalid(format!(
                 "flac: STREAMINFO is {} bytes, needs {}",
                 b.len(),
                 Self::LEN
@@ -56,10 +56,10 @@ impl StreamInfo {
             md5: b[18..34].try_into().expect("16 bytes"),
         };
         if info.sample_rate == 0 {
-            return Err(AudioError::Decode("flac: STREAMINFO sample rate is 0".into()));
+            return Err(Error::Invalid("flac: STREAMINFO sample rate is 0".into()));
         }
         if info.bits_per_sample < 4 {
-            return Err(AudioError::Decode(format!(
+            return Err(Error::Invalid(format!(
                 "flac: STREAMINFO bit depth {} is below the minimum of 4",
                 info.bits_per_sample
             )));
@@ -92,22 +92,22 @@ pub fn block_header(last: bool, kind: u8, len: usize) -> [u8; 4] {
 /// Walk a run of metadata blocks (as they follow the `fLaC` marker, or fill
 /// an MP4 `dfLa` box) and return STREAMINFO, which must come first, plus the
 /// byte length the blocks took (up to and including the last-flagged one).
-pub fn parse_metadata_blocks(b: &[u8]) -> Result<(StreamInfo, usize), AudioError> {
+pub fn parse_metadata_blocks(b: &[u8]) -> Result<(StreamInfo, usize), Error> {
     let mut at = 0usize;
     let mut info = None;
     loop {
         let Some(h) = b.get(at..at + 4) else {
-            return Err(AudioError::Decode("flac: metadata ends inside a block header".into()));
+            return Err(Error::Invalid("flac: metadata ends inside a block header".into()));
         };
         let last = h[0] & 0x80 != 0;
         let kind = h[0] & 0x7F;
         let len = (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
         let body = b
             .get(at + 4..at + 4 + len)
-            .ok_or_else(|| AudioError::Decode(format!("flac: metadata block of type {kind} runs past the data")))?;
+            .ok_or_else(|| Error::Invalid(format!("flac: metadata block of type {kind} runs past the data")))?;
         if info.is_none() {
             if kind != BLOCK_STREAMINFO {
-                return Err(AudioError::Decode(format!(
+                return Err(Error::Invalid(format!(
                     "flac: the first metadata block is type {kind}, not STREAMINFO"
                 )));
             }
@@ -125,7 +125,7 @@ pub fn parse_metadata_blocks(b: &[u8]) -> Result<(StreamInfo, usize), AudioError
 /// head (`fLaC` + blocks, as Matroska's `A_FLAC` CodecPrivate holds it), the
 /// bare blocks (an MP4 `dfLa` body after its version and flags), the `dfLa`
 /// body with them, or a bare 34-byte STREAMINFO.
-pub fn stream_info_from_extra(extra: &[u8]) -> Result<StreamInfo, AudioError> {
+pub fn stream_info_from_extra(extra: &[u8]) -> Result<StreamInfo, Error> {
     if let Some(rest) = extra.strip_prefix(b"fLaC") {
         return Ok(parse_metadata_blocks(rest)?.0);
     }
@@ -141,7 +141,7 @@ pub fn stream_info_from_extra(extra: &[u8]) -> Result<StreamInfo, AudioError> {
     if extra.len() > 4 && extra[..4] == [0, 0, 0, 0] && looks_like_blocks(&extra[4..]) {
         return Ok(parse_metadata_blocks(&extra[4..])?.0);
     }
-    Err(AudioError::Decode(format!(
+    Err(Error::Invalid(format!(
         "flac: no STREAMINFO in the {}-byte codec configuration",
         extra.len()
     )))

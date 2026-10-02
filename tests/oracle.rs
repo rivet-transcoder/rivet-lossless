@@ -8,13 +8,17 @@
 //! Each test SKIPs (passes, printing why) when the tool it needs is not on
 //! PATH, so the suite runs anywhere — unless `RIVET_REQUIRE_LOSSLESS_ORACLES`
 //! is set, as CI sets it, where a missing tool is a failure.
+//!
+//! The files go in and out through the few container pieces at the end of
+//! this file — a native FLAC stream, the boxes of an MP4 audio track, the
+//! elements of a Matroska one — just enough to reach the packets and the
+//! codec configuration.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use codec::audio::decode::{AlacDecoder, FlacDecoder};
-use codec::audio::encode::flac::{FlacEncoderConfig, FlacLevel};
-use codec::audio::encode::{AlacEncoder, FlacEncoder};
+use lossless::flac::{EncoderConfig as FlacEncoderConfig, Level as FlacLevel};
+use lossless::{alac, flac};
 
 fn have(tool: &str) -> bool {
     let arg = if tool == "flac" { "--version" } else { "-version" };
@@ -92,24 +96,19 @@ fn read_raw(path: &Path, bits: u32) -> Vec<i32> {
         .collect()
 }
 
-/// The audio track of a file, as the job engine reads it.
-fn demux_audio(data: &[u8]) -> container::streaming::AudioSource {
-    container::streaming::demux_audio(bytes::Bytes::copy_from_slice(data)).unwrap().expect("an audio track")
-}
-
-fn decode_flac_track(track: &container::demux::AudioTrack) -> (Vec<i32>, FlacDecoder) {
-    let mut dec = FlacDecoder::new(Some(&track.codec_private), track.sample_rate, track.channels as u8).unwrap();
+fn decode_flac_track(track: &Track) -> (Vec<i32>, flac::Decoder) {
+    let mut dec = flac::Decoder::new(Some(&track.config), 0, 0).unwrap();
     let mut out = Vec::new();
-    for p in &track.samples {
+    for p in &track.packets {
         out.extend(dec.decode_int(p).unwrap().0);
     }
     (out, dec)
 }
 
-fn decode_alac_track(track: &container::demux::AudioTrack) -> Vec<i32> {
-    let mut dec = AlacDecoder::new(Some(&track.codec_private)).unwrap();
+fn decode_alac_track(track: &Track) -> Vec<i32> {
+    let mut dec = alac::Decoder::new(Some(&track.config)).unwrap();
     let mut out = Vec::new();
-    for p in &track.samples {
+    for p in &track.packets {
         out.extend(dec.decode_int(p).unwrap());
     }
     out
@@ -163,12 +162,12 @@ fn flac_cli_streams_decode_bit_exact() {
             .arg(&raw));
         let data = std::fs::read(&flac).unwrap();
         let src = demux_audio(&data);
-        assert_eq!(src.track.codec, "flac");
-        let (got, dec) = decode_flac_track(&src.track);
+        assert_eq!(src.codec, "flac");
+        let (got, dec) = decode_flac_track(&src);
         let label = format!("{rate} Hz {channels}ch {bits}-bit flac {args:?}");
         assert!(got == pcm, "{label}: {}", first_mismatch(&got, &pcm));
         assert_eq!(dec.md5_matches(), Some(true), "{label}: MD5");
-        assert_eq!(src.track.durations.iter().map(|&d| d as usize).sum::<usize>(), pcm.len() / channels);
+        assert_eq!(dec.samples_decoded() as usize, pcm.len() / channels);
         eprintln!("ok: {label}");
     }
 }
@@ -200,10 +199,10 @@ fn flac_in_mp4_and_matroska_decodes_bit_exact() {
                 .args(["-c:a", "copy", "-strict", "-2"])
                 .arg(&out));
             let src = demux_audio(&std::fs::read(&out).unwrap());
-            assert_eq!(src.track.codec, "flac", "{ext}");
-            let (got, _) = decode_flac_track(&src.track);
+            assert_eq!(src.codec, "flac", "{ext}");
+            let (got, dec) = decode_flac_track(&src);
             assert!(got == pcm, "FLAC in {ext} {channels}ch {bits}-bit: {}", first_mismatch(&got, &pcm));
-            assert_eq!(src.track.durations.iter().map(|&d| u64::from(d)).sum::<u64>(), (pcm.len() / channels) as u64);
+            assert_eq!(dec.samples_decoded(), (pcm.len() / channels) as u64);
             eprintln!("ok: FLAC in {ext} {rate} Hz {channels}ch {bits}-bit");
         }
     }
@@ -254,8 +253,8 @@ fn ffmpeg_alac_decodes_bit_exact() {
                 .args(["-c:a", "alac"])
                 .arg(&out));
             let src = demux_audio(&std::fs::read(&out).unwrap());
-            assert_eq!(src.track.codec, "alac", "{ext}");
-            let got = decode_alac_track(&src.track);
+            assert_eq!(src.codec, "alac", "{ext}");
+            let got = decode_alac_track(&src);
             let label = format!("ALAC in {ext} {rate} Hz {channels}ch {bits}-bit");
             assert!(got == pcm, "{label}: {}", first_mismatch(&got, &pcm));
             eprintln!("ok: {label}");
@@ -265,14 +264,14 @@ fn ffmpeg_alac_decodes_bit_exact() {
 
 fn rivet_flac(pcm: &[i32], rate: u32, channels: u8, bits: u8, level: FlacLevel) -> (Vec<u8>, Vec<(Vec<u8>, u32)>) {
     let mut enc =
-        FlacEncoder::new(FlacEncoderConfig { sample_rate: rate, channels, bits_per_sample: bits, level }).unwrap();
+        flac::Encoder::new(FlacEncoderConfig { sample_rate: rate, channels, bits_per_sample: bits, level }).unwrap();
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     (enc.metadata_blocks(), frames)
 }
 
 fn rivet_alac(pcm: &[i32], rate: u32, channels: u8, bits: u8) -> (Vec<u8>, Vec<(Vec<u8>, u32)>) {
-    let mut enc = AlacEncoder::new(rate, channels, bits).unwrap();
+    let mut enc = alac::Encoder::new(rate, channels, bits).unwrap();
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     (enc.cookie().to_bytes().to_vec(), frames)
@@ -319,7 +318,7 @@ fn rivet_flac_decodes_bit_exact_in_flac_and_ffmpeg() {
         let (blocks, frames) = rivet_flac(&pcm, rate, channels, bits, level);
         let label = format!("rivet FLAC {rate} Hz {channels}ch {bits}-bit {level:?}");
         let native = scratch(&format!("e{i}.flac"));
-        std::fs::write(&native, container::mux::write_native_flac(&blocks, &frames).unwrap()).unwrap();
+        std::fs::write(&native, native_flac(&blocks, &frames)).unwrap();
         // The reference decoder, with its MD5 check.
         run(Command::new("flac").args(["--silent", "-t"]).arg(&native));
         let raw = scratch(&format!("e{i}.dec.raw"));
@@ -333,10 +332,8 @@ fn rivet_flac_decodes_bit_exact_in_flac_and_ffmpeg() {
             let got = ffmpeg_decode(&native, u32::from(bits));
             assert!(got == pcm, "{label} via ffmpeg: {}", first_mismatch(&got, &pcm));
             // FLAC in MP4.
-            let info = container::AudioInfo::flac(rate, u16::from(channels), blocks.clone());
             let mp4 = scratch(&format!("e{i}.mp4"));
-            std::fs::write(&mp4, container::mux::write_audio_mp4(&info, &frames, Default::default()).unwrap())
-                .unwrap();
+            std::fs::write(&mp4, m4a(Entry::Flac(&blocks), rate, channels, bits, &frames)).unwrap();
             let got = ffmpeg_decode(&mp4, u32::from(bits));
             assert!(got == pcm, "{label} in MP4 via ffmpeg: {}", first_mismatch(&got, &pcm));
         }
@@ -368,19 +365,18 @@ fn rivet_alac_decodes_bit_exact_in_ffmpeg() {
     for (i, &(rate, channels, bits)) in cases.iter().enumerate() {
         let pcm = signal(rate as usize * 3 / 2 + 321, usize::from(channels), u32::from(bits), 300 + i as u32);
         let (cookie, frames) = rivet_alac(&pcm, rate, channels, bits);
-        let info = container::AudioInfo::alac(rate, u16::from(channels), cookie);
-        let m4a = scratch(&format!("r{i}.m4a"));
-        std::fs::write(&m4a, container::mux::write_audio_mp4(&info, &frames, Default::default()).unwrap()).unwrap();
+        let m4a_path = scratch(&format!("r{i}.m4a"));
+        std::fs::write(&m4a_path, m4a(Entry::Alac(&cookie), rate, channels, bits, &frames)).unwrap();
         // 20-bit audio comes out of ffmpeg left-justified in 24 bits.
         let (out_bits, shift) = match bits {
             20 => (24, 4),
             b => (u32::from(b), 0),
         };
-        let mut got: Vec<i32> = ffmpeg_decode(&m4a, out_bits).into_iter().map(|s| s >> shift).collect();
+        let mut got: Vec<i32> = ffmpeg_decode(&m4a_path, out_bits).into_iter().map(|s| s >> shift).collect();
         // ffmpeg names ALAC's seven channels 6.1(back) (… BL BR BC); the
         // pipeline's 6.1 is FL FR FC LFE BC SL SR.
         if channels == 7 {
-            for f in got.chunks_exact_mut(7) {
+            for f in got.as_chunks_mut::<7>().0 {
                 let (ls, rs, cs) = (f[4], f[5], f[6]);
                 f[4..7].copy_from_slice(&[cs, ls, rs]);
             }
@@ -442,7 +438,7 @@ fn compression_against_the_reference_encoders() {
             .iter()
             .map(|&l| {
                 let (blocks, frames) = rivet_flac(pcm, rate, 2, *bits as u8, l);
-                container::mux::write_native_flac(&blocks, &frames).unwrap().len()
+                native_flac(&blocks, &frames).len()
             })
             .collect();
         let reference = scratch(&format!("c{i}.flac"));
@@ -455,8 +451,7 @@ fn compression_against_the_reference_encoders() {
             .arg(&raw));
         let flac5 = std::fs::metadata(&reference).unwrap().len() as usize;
         let (cookie, frames_a) = rivet_alac(pcm, rate, 2, *bits as u8);
-        let info = container::AudioInfo::alac(rate, 2, cookie);
-        let rivet_alac_len = container::mux::write_audio_mp4(&info, &frames_a, Default::default()).unwrap().len();
+        let rivet_alac_len = m4a(Entry::Alac(&cookie), rate, 2, *bits as u8, &frames_a).len();
         let ff = scratch(&format!("c{i}.m4a"));
         let fmt = if *bits == 16 { "s16le" } else { "s24le" };
         run(Command::new("ffmpeg")
@@ -477,4 +472,269 @@ fn compression_against_the_reference_encoders() {
         );
         assert!(rivet.iter().all(|&n| n < raw_len) && rivet_alac_len < raw_len + raw_len / 50);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Containers: just enough of each to reach the packets and the codec
+// configuration, and to wrap this crate's output for the reference tools.
+// ---------------------------------------------------------------------------
+
+/// What the tests need of a file's one audio track.
+struct Track {
+    codec: &'static str,
+    /// The codec configuration as the container holds it: the native
+    /// stream's head (`fLaC` + metadata blocks), a `dfLa` or `alac` box's
+    /// body, or Matroska CodecPrivate.
+    config: Vec<u8>,
+    packets: Vec<Vec<u8>>,
+}
+
+fn demux_audio(data: &[u8]) -> Track {
+    if data.starts_with(b"fLaC") {
+        read_native_flac(data)
+    } else if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        read_matroska(data)
+    } else {
+        read_mp4(data)
+    }
+}
+
+/// A native FLAC stream: `fLaC`, the metadata blocks, then the frames back
+/// to back — handed over as one packet, which the decoder takes frame by
+/// frame.
+fn read_native_flac(data: &[u8]) -> Track {
+    let (_, blocks) = flac::parse_metadata_blocks(&data[4..]).unwrap();
+    let head = 4 + blocks;
+    Track { codec: "flac", config: data[..head].to_vec(), packets: vec![data[head..].to_vec()] }
+}
+
+/// `fLaC`, STREAMINFO (alone, flagged last, as the encoder gives it) and
+/// the frames.
+fn native_flac(blocks: &[u8], frames: &[(Vec<u8>, u32)]) -> Vec<u8> {
+    let mut out = b"fLaC".to_vec();
+    out.extend_from_slice(blocks);
+    for (f, _) in frames {
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// The boxes directly inside `data` (ISO/IEC 14496-12): `(type, body)`.
+fn boxes(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        let size = be32(data, i) as usize;
+        let kind: [u8; 4] = data[i + 4..i + 8].try_into().unwrap();
+        let (header, size) = match size {
+            1 => (16, u64::from_be_bytes(data[i + 8..i + 16].try_into().unwrap()) as usize),
+            0 => (8, data.len() - i),
+            n => (8, n),
+        };
+        out.push((kind, &data[i + header..i + size]));
+        i += size;
+    }
+    out
+}
+
+fn child<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> &'a [u8] {
+    path.iter().fold(data, |d, want| {
+        boxes(d).into_iter().find(|(k, _)| k == *want).unwrap_or_else(|| panic!("no {want:?} box")).1
+    })
+}
+
+/// The first track of an MP4: its sample entry's configuration box body
+/// and its samples, through `stsz`, `stsc` and `stco` / `co64`.
+fn read_mp4(data: &[u8]) -> Track {
+    let stbl = child(data, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]);
+    let stsd = child(stbl, &[b"stsd"]);
+    let (kind, entry) = boxes(&stsd[8..])[0];
+    // An AudioSampleEntry's fields take 28 bytes; QuickTime's sound
+    // descriptions of version 1 and 2 take 44 and 64.
+    let head = match u16::from_be_bytes([entry[8], entry[9]]) {
+        1 => 44,
+        2 => 64,
+        _ => 28,
+    };
+    let (codec, want) = match &kind {
+        b"fLaC" => ("flac", b"dfLa"),
+        b"alac" => ("alac", b"alac"),
+        k => panic!("sample entry {:?}", String::from_utf8_lossy(k)),
+    };
+    let config = boxes(&entry[head..]).into_iter().find(|(k, _)| k == want).expect("the configuration box").1;
+
+    let stsz = child(stbl, &[b"stsz"]);
+    let count = be32(stsz, 8) as usize;
+    let sizes: Vec<usize> = match be32(stsz, 4) {
+        0 => (0..count).map(|i| be32(stsz, 12 + 4 * i) as usize).collect(),
+        fixed => vec![fixed as usize; count],
+    };
+    let tables = boxes(stbl);
+    let offsets: Vec<u64> = if let Some((_, co)) = tables.iter().find(|(k, _)| k == b"stco") {
+        (0..be32(co, 4) as usize).map(|i| u64::from(be32(co, 8 + 4 * i))).collect()
+    } else {
+        let co = child(stbl, &[b"co64"]);
+        (0..be32(co, 4) as usize).map(|i| u64::from_be_bytes(co[8 + 8 * i..16 + 8 * i].try_into().unwrap())).collect()
+    };
+    let stsc = child(stbl, &[b"stsc"]);
+    let runs: Vec<(usize, usize)> =
+        (0..be32(stsc, 4) as usize).map(|i| (be32(stsc, 8 + 12 * i) as usize, be32(stsc, 12 + 12 * i) as usize)).collect();
+    let mut packets = Vec::with_capacity(count);
+    let mut sample = 0;
+    for (chunk, &offset) in offsets.iter().enumerate() {
+        let per = runs.iter().rev().find(|(first, _)| *first <= chunk + 1).expect("an stsc run").1;
+        let mut at = offset as usize;
+        for _ in 0..per.min(count - sample) {
+            packets.push(data[at..at + sizes[sample]].to_vec());
+            at += sizes[sample];
+            sample += 1;
+        }
+    }
+    assert_eq!(packets.len(), count, "every sample placed");
+    Track { codec, config: config.to_vec(), packets }
+}
+
+/// What an `.m4a` written by [`m4a`] carries.
+enum Entry<'a> {
+    /// The metadata blocks, for a `dfLa` box.
+    Flac(&'a [u8]),
+    /// The 24-byte magic cookie, for an `alac` box.
+    Alac(&'a [u8]),
+}
+
+fn mp4_box(kind: &[u8; 4], parts: &[&[u8]]) -> Vec<u8> {
+    let len = 8 + parts.iter().map(|p| p.len()).sum::<usize>();
+    let mut b = (len as u32).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    for p in parts {
+        b.extend_from_slice(p);
+    }
+    b
+}
+
+/// An audio-only MP4 of one track and one chunk: `ftyp`, `moov`, `mdat`.
+/// The sample rate is the media timescale (and, above 65535 Hz, 0 in the
+/// sample entry's 16.16 field, which cannot hold it).
+fn m4a(entry: Entry<'_>, rate: u32, channels: u8, bits: u8, frames: &[(Vec<u8>, u32)]) -> Vec<u8> {
+    let u16b = |v: u16| v.to_be_bytes();
+    let u32b = |v: u32| v.to_be_bytes();
+    let total: u32 = frames.iter().map(|(_, n)| n).sum();
+    let matrix: Vec<u8> = [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000].iter().flat_map(|v| v.to_be_bytes()).collect();
+
+    let (kind, config) = match entry {
+        Entry::Flac(blocks) => (b"fLaC", mp4_box(b"dfLa", &[&[0; 4], blocks])),
+        Entry::Alac(cookie) => (b"alac", mp4_box(b"alac", &[&[0; 4], cookie])),
+    };
+    let sample_entry = mp4_box(
+        kind,
+        &[
+            &[0; 6],
+            &u16b(1),
+            &[0; 8],
+            &u16b(u16::from(channels)),
+            &u16b(u16::from(bits)),
+            &[0; 4],
+            &u32b(if rate <= 0xFFFF { rate << 16 } else { 0 }),
+            &config,
+        ],
+    );
+    let stsd = mp4_box(b"stsd", &[&[0; 4], &u32b(1), &sample_entry]);
+    let mut stts_runs: Vec<(u32, u32)> = Vec::new();
+    for &(_, n) in frames {
+        match stts_runs.last_mut() {
+            Some((count, d)) if *d == n => *count += 1,
+            _ => stts_runs.push((1, n)),
+        }
+    }
+    let stts_body: Vec<u8> = stts_runs.iter().flat_map(|&(c, d)| [c.to_be_bytes(), d.to_be_bytes()].concat()).collect();
+    let stts = mp4_box(b"stts", &[&[0; 4], &u32b(stts_runs.len() as u32), &stts_body]);
+    let stsc = mp4_box(b"stsc", &[&[0; 4], &u32b(1), &u32b(1), &u32b(frames.len() as u32), &u32b(1)]);
+    let sizes: Vec<u8> = frames.iter().flat_map(|(f, _)| (f.len() as u32).to_be_bytes()).collect();
+    let stsz = mp4_box(b"stsz", &[&[0; 4], &u32b(0), &u32b(frames.len() as u32), &sizes]);
+    let ftyp = mp4_box(b"ftyp", &[b"M4A ", &[0; 4], b"M4A mp42isom"]);
+
+    let moov = |mdat_at: u32| -> Vec<u8> {
+        let stco = mp4_box(b"stco", &[&[0; 4], &u32b(1), &u32b(mdat_at + 8)]);
+        let stbl = mp4_box(b"stbl", &[&stsd, &stts, &stsc, &stsz, &stco]);
+        let dinf = mp4_box(b"dinf", &[&mp4_box(b"dref", &[&[0; 4], &u32b(1), &mp4_box(b"url ", &[&[0, 0, 0, 1]])])]);
+        let minf = mp4_box(b"minf", &[&mp4_box(b"smhd", &[&[0; 8]]), &dinf, &stbl]);
+        let hdlr = mp4_box(b"hdlr", &[&[0; 8], b"soun", &[0; 12], b"\0"]);
+        let mdhd = mp4_box(b"mdhd", &[&[0; 12], &u32b(rate), &u32b(total), &u16b(0x55C4), &[0; 2]]);
+        let mdia = mp4_box(b"mdia", &[&mdhd, &hdlr, &minf]);
+        let tkhd = mp4_box(
+            b"tkhd",
+            &[&[0, 0, 0, 3], &[0; 8], &u32b(1), &[0; 4], &u32b(total), &[0; 12], &u16b(0x0100), &[0; 2], &matrix, &[0; 8]],
+        );
+        let trak = mp4_box(b"trak", &[&tkhd, &mdia]);
+        let mvhd = mp4_box(
+            b"mvhd",
+            &[&[0; 12], &u32b(rate), &u32b(total), &u32b(0x0001_0000), &u16b(0x0100), &[0; 10], &matrix, &[0; 24], &u32b(2)],
+        );
+        mp4_box(b"moov", &[&mvhd, &trak])
+    };
+    // The chunk offset's value does not change the moov's size.
+    let moov_len = moov(0).len();
+    let mut out = ftyp.clone();
+    out.extend_from_slice(&moov((ftyp.len() + moov_len) as u32));
+    let payload: Vec<&[u8]> = frames.iter().map(|(f, _)| f.as_slice()).collect();
+    out.extend_from_slice(&mp4_box(b"mdat", &payload));
+    out
+}
+
+/// An EBML element ID at `at` (its length marker kept): (id, length).
+fn ebml_id(data: &[u8], at: usize) -> (u32, usize) {
+    let len = data[at].leading_zeros() as usize + 1;
+    (data[at..at + len].iter().fold(0u32, |v, &b| (v << 8) | u32::from(b)), len)
+}
+
+/// An EBML variable-length integer at `at` (its length marker removed):
+/// (value, length); a size of all ones (unknown) comes back as `None`.
+fn ebml_vint(data: &[u8], at: usize) -> (Option<u64>, usize) {
+    let len = data[at].leading_zeros() as usize + 1;
+    let first = u64::from(data[at]) & (0xFF >> len);
+    let v = data[at + 1..at + len].iter().fold(first, |v, &b| (v << 8) | u64::from(b));
+    let unknown = v == (1u64 << (7 * len)) - 1;
+    (if unknown { None } else { Some(v) }, len)
+}
+
+/// A Matroska file's one audio track: CodecID, CodecPrivate, and the frames
+/// of its SimpleBlocks and Blocks (unlaced, as ffmpeg writes audio).
+fn read_matroska(data: &[u8]) -> Track {
+    const MASTERS: [u32; 5] = [0x1853_8067, 0x1654_AE6B, 0xAE, 0x1F43_B675, 0xA0];
+    let (mut codec, mut config, mut packets) = (None, Vec::new(), Vec::new());
+    let mut at = 0;
+    while at < data.len() {
+        let (id, n) = ebml_id(data, at);
+        at += n;
+        let (size, n) = ebml_vint(data, at);
+        at += n;
+        if MASTERS.contains(&id) {
+            continue; // descend
+        }
+        let size = size.expect("an unknown size on an element that is not a master") as usize;
+        let body = &data[at..at + size];
+        match id {
+            0x86 => {
+                codec = Some(match body {
+                    b"A_FLAC" => "flac",
+                    b"A_ALAC" => "alac",
+                    other => panic!("CodecID {}", String::from_utf8_lossy(other)),
+                })
+            }
+            0x63A2 => config = body.to_vec(),
+            0xA3 | 0xA1 => {
+                let (_, track_len) = ebml_vint(body, 0);
+                let flags = body[track_len + 2];
+                assert_eq!(flags & 0x06, 0, "laced block");
+                packets.push(body[track_len + 3..].to_vec());
+            }
+            _ => {}
+        }
+        at += size;
+    }
+    Track { codec: codec.expect("a CodecID"), config, packets }
 }

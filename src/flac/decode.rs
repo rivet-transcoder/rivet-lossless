@@ -9,18 +9,18 @@
 //! sizes. Both CRCs are checked, and when STREAMINFO carries an MD5 the
 //! decoded audio is hashed and compared at the end of the stream.
 //!
-//! FLAC's channel order for every count (§9.1.3) is the pipeline's native
-//! order (mono; FL FR; FL FR FC; FL FR BL BR; FL FR FC BL BR; 5.1 FL FR FC
-//! LFE BL BR; 6.1 FL FR FC LFE BC SL SR; 7.1 FL FR FC LFE BL BR SL SR), so
-//! the channels pass through in place.
+//! FLAC's channel order for every count (§9.1.3) is the native order of
+//! most PCM pipelines (mono; FL FR; FL FR FC; FL FR BL BR; FL FR FC BL BR;
+//! 5.1 FL FR FC LFE BL BR; 6.1 FL FR FC LFE BC SL SR; 7.1 FL FR FC LFE BL
+//! BR SL SR; see [`layout`](super::layout)), so the channels pass through
+//! in place.
 
-use crate::audio::lossless::bits::BitReader;
-use crate::audio::lossless::flac::{StreamInfo, crc8, crc16, md5_bytes, stream_info_from_extra};
-use crate::audio::lossless::ints_to_f32;
-use crate::audio::{AudioDecoder, AudioError, AudioFrame};
+use super::format::{StreamInfo, crc8, crc16, md5_bytes, stream_info_from_extra};
+use crate::Error;
+use crate::bits::BitReader;
 
-fn err(msg: impl Into<String>) -> AudioError {
-    AudioError::Decode(format!("flac: {}", msg.into()))
+fn err(msg: impl Into<String>) -> Error {
+    Error::Invalid(format!("flac: {}", msg.into()))
 }
 
 /// The decoded header of one frame (§9.1).
@@ -43,7 +43,7 @@ pub struct FrameHeader {
 
 /// Parse the frame header at the start of `data`, checking its CRC-8. The
 /// sample rate and bit depth a header defers to STREAMINFO come from `info`.
-pub fn parse_frame_header(data: &[u8], info: Option<&StreamInfo>) -> Result<FrameHeader, AudioError> {
+pub fn parse_frame_header(data: &[u8], info: Option<&StreamInfo>) -> Result<FrameHeader, Error> {
     let mut br = BitReader::new(data, "flac");
     if br.read(14)? != 0x3FFE {
         return Err(err("no frame sync code"));
@@ -145,7 +145,7 @@ pub struct DecodedFrame {
 }
 
 /// Decode the frame at the start of `data`.
-pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFrame, AudioError> {
+pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFrame, Error> {
     let header = parse_frame_header(data, info)?;
     let mut br = BitReader::new(data, "flac");
     br.skip(header.len * 8)?;
@@ -196,7 +196,7 @@ pub fn decode_frame(data: &[u8], info: Option<&StreamInfo>) -> Result<DecodedFra
     Ok(DecodedFrame { header, samples, len: body + 2 })
 }
 
-fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64>, AudioError> {
+fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64>, Error> {
     if br.read_bit()? {
         return Err(err("subframe padding bit is set"));
     }
@@ -242,7 +242,7 @@ fn decode_subframe(br: &mut BitReader<'_>, n: usize, bps: u32) -> Result<Vec<i64
     Ok(out)
 }
 
-fn warmup(br: &mut BitReader<'_>, n: usize, order: usize, bps: u32) -> Result<Vec<i64>, AudioError> {
+fn warmup(br: &mut BitReader<'_>, n: usize, order: usize, bps: u32) -> Result<Vec<i64>, Error> {
     if order > n {
         return Err(err(format!("predictor order {order} exceeds the block size {n}")));
     }
@@ -254,7 +254,7 @@ fn warmup(br: &mut BitReader<'_>, n: usize, order: usize, bps: u32) -> Result<Ve
 }
 
 /// Append the block's residual (§9.2.7) to `out`, which holds the warm-up.
-fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec<i64>) -> Result<(), AudioError> {
+fn decode_residual(br: &mut BitReader<'_>, n: usize, order: usize, out: &mut Vec<i64>) -> Result<(), Error> {
     let (param_bits, escape) = match br.read_u32(2)? {
         0 => (4, 15),
         1 => (5, 31),
@@ -313,25 +313,27 @@ fn restore_lpc(s: &mut [i64], coefs: &[i64], shift: u32) {
     }
 }
 
-/// FLAC through the [`AudioDecoder`] surface.
-pub struct FlacDecoder {
+/// A FLAC stream's decoder: packets of whole frames in, interleaved
+/// integer samples out, with the STREAMINFO MD5 checked along the way.
+pub struct Decoder {
     info: Option<StreamInfo>,
     /// Running MD5 of the decoded audio, when STREAMINFO has one to check.
     md5: Option<md5::Context>,
     md5_scratch: Vec<u8>,
     samples_decoded: u64,
-    first_pts_us: Option<i64>,
-    /// Bit depth and rate of the last frame, for the f32 conversion.
+    /// Bit depth and rate of the last frame.
     bits: u32,
     sample_rate: u32,
     channels: u8,
 }
 
-impl FlacDecoder {
+impl Decoder {
     /// `extra_data` is the codec configuration: an MP4 `dfLa` body or a
-    /// Matroska CodecPrivate (`fLaC` + metadata blocks). Without it, every
-    /// frame header has to be self-describing.
-    pub fn new(extra_data: Option<&[u8]>, sample_rate: u32, channels: u8) -> Result<Self, AudioError> {
+    /// Matroska CodecPrivate (`fLaC` + metadata blocks), in any form
+    /// [`stream_info_from_extra`] takes. Without it, every frame header has
+    /// to be self-describing, and `sample_rate` and `channels` (the
+    /// container's) stand until the first frame says otherwise.
+    pub fn new(extra_data: Option<&[u8]>, sample_rate: u32, channels: u8) -> Result<Self, Error> {
         let info = match extra_data {
             Some(e) if !e.is_empty() => Some(stream_info_from_extra(e)?),
             _ => None,
@@ -345,7 +347,6 @@ impl FlacDecoder {
             md5,
             md5_scratch: Vec::new(),
             samples_decoded: 0,
-            first_pts_us: None,
         })
     }
 
@@ -354,9 +355,31 @@ impl FlacDecoder {
         self.info.as_ref()
     }
 
+    /// The sample rate: STREAMINFO's or the container's until a frame has
+    /// been decoded, then the last frame's.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// The channel count, on the same terms as [`sample_rate`](Self::sample_rate).
+    pub fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    /// The bit depth, on the same terms as [`sample_rate`](Self::sample_rate)
+    /// (16 when neither a STREAMINFO nor a frame has named one).
+    pub fn bits_per_sample(&self) -> u32 {
+        self.bits
+    }
+
+    /// Samples per channel decoded so far.
+    pub fn samples_decoded(&self) -> u64 {
+        self.samples_decoded
+    }
+
     /// Decode every frame in `packet` to interleaved integer samples, with
     /// the channel count and bit depth they are at.
-    pub fn decode_int(&mut self, packet: &[u8]) -> Result<(Vec<i32>, u8, u32), AudioError> {
+    pub fn decode_int(&mut self, packet: &[u8]) -> Result<(Vec<i32>, u8, u32), Error> {
         let mut at = 0usize;
         let mut out = Vec::new();
         while packet.len() - at >= 2 && packet[at] == 0xFF && packet[at + 1] & 0xFE == 0xF8 {
@@ -393,25 +416,5 @@ impl FlacDecoder {
             return None;
         }
         Some(ctx.clone().compute().0 == info.md5)
-    }
-}
-
-impl AudioDecoder for FlacDecoder {
-    fn decode(&mut self, packet: &[u8], pts: i64) -> Result<Vec<AudioFrame>, AudioError> {
-        let first_pts_us = *self.first_pts_us.get_or_insert(pts);
-        let before = self.samples_decoded;
-        let (samples, channels, bits) = self.decode_int(packet)?;
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-        let pts = first_pts_us + (before as i64 * 1_000_000) / i64::from(self.sample_rate.max(1));
-        Ok(vec![AudioFrame { samples: ints_to_f32(&samples, bits), sample_rate: self.sample_rate, channels, pts }])
-    }
-
-    fn flush(&mut self) -> Result<Vec<AudioFrame>, AudioError> {
-        if self.md5_matches() == Some(false) {
-            tracing::warn!("flac: the decoded audio does not match the stream's MD5 signature");
-        }
-        Ok(Vec::new())
     }
 }

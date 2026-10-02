@@ -1,5 +1,5 @@
 use super::*;
-use crate::audio::decode::flac::{FlacDecoder, decode_frame};
+use crate::flac::{Decoder, decode_frame};
 
 fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
     let full = ((1i64 << (bits - 1)) - 1) as f64;
@@ -26,13 +26,13 @@ fn signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
     out
 }
 
-fn round_trip(pcm: &[i32], channels: u8, bits: u8, level: FlacLevel) -> (Vec<u8>, StreamInfo) {
+fn round_trip(pcm: &[i32], channels: u8, bits: u8, level: Level) -> (Vec<u8>, StreamInfo) {
     let mut enc =
-        FlacEncoder::new(FlacEncoderConfig { sample_rate: 44_100, channels, bits_per_sample: bits, level }).unwrap();
+        Encoder::new(EncoderConfig { sample_rate: 44_100, channels, bits_per_sample: bits, level }).unwrap();
     let mut frames = enc.encode_int(pcm);
     frames.extend(enc.finish());
     let info = enc.stream_info();
-    let mut dec = FlacDecoder::new(Some(&enc.metadata_blocks()), 44_100, channels).unwrap();
+    let mut dec = Decoder::new(Some(&enc.metadata_blocks()), 44_100, channels).unwrap();
     let mut got = Vec::new();
     let mut stream = Vec::new();
     for (f, n) in &frames {
@@ -49,7 +49,7 @@ fn round_trip(pcm: &[i32], channels: u8, bits: u8, level: FlacLevel) -> (Vec<u8>
 
 #[test]
 fn every_level_depth_and_layout_round_trips() {
-    for level in [FlacLevel::Fast, FlacLevel::Default, FlacLevel::Best] {
+    for level in [Level::Fast, Level::Default, Level::Best] {
         for (channels, bits) in [(1u8, 16u8), (2, 16), (2, 24), (6, 24), (8, 16)] {
             let pcm = signal(10_000, usize::from(channels), u32::from(bits), 7);
             round_trip(&pcm, channels, bits, level);
@@ -57,7 +57,7 @@ fn every_level_depth_and_layout_round_trips() {
     }
     for bits in [4u8, 8, 12, 20, 32] {
         let pcm = signal(5_000, 2, u32::from(bits), 3);
-        round_trip(&pcm, 2, bits, FlacLevel::Default);
+        round_trip(&pcm, 2, bits, Level::Default);
     }
 }
 
@@ -75,7 +75,7 @@ fn edge_shapes_round_trip() {
         ((0..9_000).map(|i| if (i / 3) % 2 == 0 { 32_767 } else { -32_768 }).collect(), 1),
     ];
     for (pcm, ch) in cases {
-        let (_, info) = round_trip(&pcm, ch, 16, FlacLevel::Default);
+        let (_, info) = round_trip(&pcm, ch, 16, Level::Default);
         assert_eq!(info.total_samples, (pcm.len() / usize::from(ch)) as u64);
     }
 }
@@ -85,11 +85,11 @@ fn stereo_decorrelation_is_used_on_correlated_channels() {
     // Identical channels: the side channel is all zeros.
     let mono = signal(BLOCK_SIZE, 1, 16, 9);
     let pcm: Vec<i32> = mono.iter().flat_map(|&s| [s, s]).collect();
-    let mut enc = FlacEncoder::new(FlacEncoderConfig {
+    let mut enc = Encoder::new(EncoderConfig {
         sample_rate: 48_000,
         channels: 2,
         bits_per_sample: 16,
-        level: FlacLevel::Default,
+        level: Level::Default,
     })
     .unwrap();
     let frames = enc.encode_int(&pcm);
@@ -116,7 +116,7 @@ fn coded_numbers_use_the_utf8_form() {
 #[test]
 fn streaminfo_describes_the_stream() {
     let pcm = signal(10_000, 2, 16, 5);
-    let (_, info) = round_trip(&pcm, 2, 16, FlacLevel::Default);
+    let (_, info) = round_trip(&pcm, 2, 16, Level::Default);
     assert_eq!((info.min_block_size, info.max_block_size), (4096, 4096));
     assert_eq!(info.total_samples, 10_000);
     assert!(info.min_frame_size > 0 && info.min_frame_size <= info.max_frame_size);

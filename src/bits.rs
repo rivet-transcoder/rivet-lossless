@@ -5,7 +5,7 @@
 //! channel of 32-bit audio is 33 bits wide), so the reader hands out up to 64
 //! bits and the writer takes as many.
 
-use crate::audio::AudioError;
+use crate::Error;
 
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
@@ -30,8 +30,8 @@ impl<'a> BitReader<'a> {
         self.data.len() * 8 - self.pos
     }
 
-    fn overrun(&self, n: u32) -> AudioError {
-        AudioError::Decode(format!(
+    fn overrun(&self, n: u32) -> Error {
+        Error::Invalid(format!(
             "{}: read of {n} bits at bit {} runs past the end of a {}-byte packet",
             self.codec,
             self.pos,
@@ -40,7 +40,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` (≤ 64) bits as an unsigned value.
-    pub fn read(&mut self, n: u32) -> Result<u64, AudioError> {
+    pub fn read(&mut self, n: u32) -> Result<u64, Error> {
         debug_assert!(n <= 64);
         if n == 0 {
             return Ok(0);
@@ -64,17 +64,17 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` (≤ 32) bits as an unsigned value.
-    pub fn read_u32(&mut self, n: u32) -> Result<u32, AudioError> {
+    pub fn read_u32(&mut self, n: u32) -> Result<u32, Error> {
         debug_assert!(n <= 32);
         Ok(self.read(n)? as u32)
     }
 
-    pub fn read_bit(&mut self) -> Result<bool, AudioError> {
+    pub fn read_bit(&mut self) -> Result<bool, Error> {
         Ok(self.read(1)? == 1)
     }
 
     /// Read `n` (1..=64) bits as a two's-complement value.
-    pub fn read_signed(&mut self, n: u32) -> Result<i64, AudioError> {
+    pub fn read_signed(&mut self, n: u32) -> Result<i64, Error> {
         if n == 0 {
             return Ok(0);
         }
@@ -85,7 +85,7 @@ impl<'a> BitReader<'a> {
 
     /// Count `0` bits up to the next `1`, and consume that `1` (FLAC's
     /// unary: the quotient of a Rice code, the wasted-bits count).
-    pub fn read_unary_zeros(&mut self) -> Result<u32, AudioError> {
+    pub fn read_unary_zeros(&mut self) -> Result<u32, Error> {
         let mut n = 0u32;
         loop {
             if self.pos >= self.data.len() * 8 {
@@ -108,7 +108,7 @@ impl<'a> BitReader<'a> {
     /// Count `1` bits up to the next `0` or until `limit` of them have been
     /// read, consuming the `0` when one ends the run (ALAC's unary prefix,
     /// which has an escape at `limit`).
-    pub fn read_unary_ones(&mut self, limit: u32) -> Result<u32, AudioError> {
+    pub fn read_unary_ones(&mut self, limit: u32) -> Result<u32, Error> {
         let mut n = 0u32;
         while n < limit {
             if !self.read_bit()? {
@@ -125,7 +125,7 @@ impl<'a> BitReader<'a> {
         self.pos -= n;
     }
 
-    pub fn skip(&mut self, n: usize) -> Result<(), AudioError> {
+    pub fn skip(&mut self, n: usize) -> Result<(), Error> {
         if n > self.remaining() {
             return Err(self.overrun(n as u32));
         }
