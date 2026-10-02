@@ -1,0 +1,2 @@
+# Every text file checks out with LF on every platform, whatever core.autocrlf says.
+* text=auto eol=lf

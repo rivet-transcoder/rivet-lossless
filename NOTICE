@@ -1,0 +1,41 @@
+rivet-lossless — FLAC and ALAC encoders and decoders
+Copyright 2026 Ely Erin Fox
+
+This product is licensed under the Open Encoding Attribution License,
+Version 1.0 (see LICENSE.md). It is source-available, not open source: the
+attribution duty in §5 applies to commercial use; §4 requires this NOTICE to
+be carried forward with any distribution.
+
+------------------------------------------------------------------------------
+Provenance
+------------------------------------------------------------------------------
+
+The FLAC and ALAC encoders and decoders are original implementations written
+from the FLAC format specification (IETF RFC 9639, and the xiph.org format
+documentation it standardises), the published description of the Apple
+Lossless format (the ALACSpecificConfig magic cookie, its channel layouts,
+the frame element syntax, and the adaptive Golomb-Rice and adaptive-predictor
+coding scheme), and published literature on linear prediction and Rice /
+Golomb coding. They are not translations of, and do not derive from, any
+other implementation's source: not libFLAC, not FFmpeg's FLAC or ALAC
+codecs, not Apple's ALAC reference code, not claxon or symphonia.
+
+Both codecs are verified against the `flac` command-line tool and ffmpeg,
+used only as black boxes (command-line tools whose output streams and PCM
+are compared); none of their code is included or was consulted.
+
+------------------------------------------------------------------------------
+Patents
+------------------------------------------------------------------------------
+
+FLAC is an open format published as RFC 9639, and Apple published ALAC and
+its reference implementation under the Apache License 2.0; both are used
+royalty-free. This licence grants no rights under any patent, and the
+authors make no claim about whether a licence is needed for any use.
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+md5 (https://crates.io/crates/md5) — Apache-2.0 OR MIT
+thiserror (https://crates.io/crates/thiserror) — MIT OR Apache-2.0
