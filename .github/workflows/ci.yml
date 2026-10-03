@@ -31,18 +31,22 @@ jobs:
         run: cargo test --lib
 
   # Both codecs are checked against independent implementations, used only
-  # as black boxes: the `flac` command-line tool and ffmpeg make the test
-  # streams and decode this crate's, and the PCM must match exactly.
-  # Without the tools on PATH those tests skip, so this job installs them
-  # and fails if they did not run.
+  # as black boxes: FLAC against the `flac` command-line tool (Xiph.Org),
+  # with `mkvmerge` (MKVToolNix) wrapping its streams in Matroska; ALAC
+  # against `alacconvert`, built here from Apple's open-source ALAC release.
+  # They make the test streams and decode this crate's, and the PCM must
+  # match exactly. Without the tools those tests skip, so this job installs
+  # them and fails if they did not run.
   oracle:
-    name: tests against flac and ffmpeg (black box)
+    name: tests against flac and Apple's ALAC (black box)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends flac ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends flac mkvtoolnix
+      - name: Build Apple's alacconvert
+        run: echo "ALACCONVERT=$(tools/build-alacconvert.sh "$RUNNER_TEMP/alac")" >> "$GITHUB_ENV"
       - name: Tests
         run: cargo test --release --test oracle -- --nocapture
         env:
