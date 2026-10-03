@@ -406,6 +406,33 @@ fn rivet_flac_decodes_bit_exact_in_flac() {
 }
 
 #[test]
+fn probe_seed_sweep() {
+    let Some(alacconvert) = tool("alacconvert") else { return };
+    let mut bad = Vec::new();
+    for channels in 1..=8usize {
+        for seed in 300..316u32 {
+            let (rate, bits) = (48_000u32, 16u32);
+            let pcm = signal(rate as usize * 3 / 2 + 321, channels, bits, seed);
+            let (cookie, frames) = rivet_alac(&pcm, rate, channels as u8, bits as u8);
+            let src = scratch(&format!("p{channels}_{seed}.alac.caf"));
+            let out = scratch(&format!("p{channels}_{seed}.pcm.caf"));
+            std::fs::write(&src, caf_alac(&cookie, rate, channels, bits, (pcm.len() / channels) as u64, &frames)).unwrap();
+            run(Command::new(&alacconvert).arg(&src).arg(&out));
+            let got = from_alac_order(&read_caf(&std::fs::read(&out).unwrap()).pcm.unwrap(), channels);
+            // our own decoder
+            let mut dec = alac::Decoder::new(Some(&cookie)).unwrap();
+            let ours: Vec<i32> = frames.iter().flat_map(|(f, _)| dec.decode_int(f).unwrap()).collect();
+            if got != pcm {
+                let m = first_mismatch(&got, &pcm);
+                eprintln!("PROBE MISMATCH {channels}ch seed {seed}: {m}; own decoder exact: {}", ours == pcm);
+                bad.push((channels, seed));
+            }
+        }
+    }
+    eprintln!("PROBE bad = {bad:?}");
+}
+
+#[test]
 fn rivet_alac_decodes_bit_exact_in_apple_alac() {
     let Some(alacconvert) = tool("alacconvert") else {
         eprintln!("SKIP: no `alacconvert`");
