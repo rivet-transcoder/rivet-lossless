@@ -91,12 +91,18 @@ impl Config {
     }
 
     /// Parse the cookie out of whatever a container hands over: the bare 24
-    /// bytes, the 28-byte `alac` FullBox body (version and flags first), a
-    /// whole `alac` atom (size + `alac` + version/flags + config), or a
-    /// QuickTime `wave` atom holding one.
+    /// bytes, the same followed by the optional 24-byte channel layout
+    /// info (a `chan` atom, as Apple's encoder writes for more than two
+    /// channels and CAF's `kuki` chunk carries), the 28-byte `alac` FullBox
+    /// body (version and flags first), a whole `alac` atom (size + `alac` +
+    /// version/flags + config), or a QuickTime `wave` atom holding one.
     pub fn parse(extra: &[u8]) -> Result<Self, Error> {
         let config = if extra.len() == Self::LEN {
             extra
+        } else if extra.len() == 2 * Self::LEN && extra[Self::LEN + 4..Self::LEN + 8] == *b"chan" {
+            // The layout info names the layout the channel count already
+            // implies (the format description's table); the count governs.
+            &extra[..Self::LEN]
         } else if extra.len() == Self::LEN + 4 && extra[..4] == [0, 0, 0, 0] {
             &extra[4..]
         } else if let Some(i) = extra.windows(4).position(|w| w == b"alac") {
@@ -523,6 +529,15 @@ mod tests {
         atom.extend_from_slice(b"alac");
         atom.extend_from_slice(&fullbox);
         assert_eq!(Config::parse(&atom).unwrap(), c);
+        // The cookie followed by its channel layout info (`chan`: size,
+        // type, version/flags, layout tag, bitmap, description count).
+        let mut with_layout = bare.to_vec();
+        with_layout.extend_from_slice(&24u32.to_be_bytes());
+        with_layout.extend_from_slice(b"chan");
+        with_layout.extend_from_slice(&[0; 4]);
+        with_layout.extend_from_slice(&((124u32 << 16) | 6).to_be_bytes());
+        with_layout.extend_from_slice(&[0; 8]);
+        assert_eq!(Config::parse(&with_layout).unwrap(), c);
     }
 
     #[test]
