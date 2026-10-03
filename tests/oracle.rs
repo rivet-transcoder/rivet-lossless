@@ -426,6 +426,41 @@ fn rivet_alac_decodes_bit_exact_in_apple_alac() {
     }
 }
 
+/// Streams of this crate's encoder that Apple's decoder decodes to other
+/// PCM than this crate's decoder does — found by a sweep of the test signal
+/// over seeds 300-419 at 48 kHz, 16 bits, 1-8 channels (13 of 960). Every
+/// one differs a few samples after a stretch of digital silence or of a
+/// constant ends, where the residual coder has been coding runs of zeros;
+/// this crate's encoder and decoder agree with each other there, so the two
+/// share whatever departs from the format. Ignored until that is found and
+/// fixed: `cargo test --release --test oracle -- --ignored`.
+#[test]
+#[ignore = "known: Apple's decoder disagrees with these streams"]
+fn rivet_alac_after_a_zero_run_decodes_bit_exact_in_apple_alac() {
+    let Some(alacconvert) = tool("alacconvert") else {
+        eprintln!("SKIP: no `alacconvert`");
+        return;
+    };
+    let known: &[(usize, u32)] =
+        &[(2, 335), (3, 327), (3, 347), (5, 371), (5, 384), (5, 388), (6, 309), (6, 381), (7, 309), (7, 320), (7, 347), (7, 396), (8, 324)];
+    let mut bad = Vec::new();
+    for &(channels, seed) in known {
+        let (rate, bits) = (48_000u32, 16u32);
+        let pcm = signal(rate as usize * 3 / 2 + 321, channels, bits, seed);
+        let (cookie, frames) = rivet_alac(&pcm, rate, channels as u8, bits as u8);
+        let src = scratch(&format!("z{channels}_{seed}.alac.caf"));
+        let out = scratch(&format!("z{channels}_{seed}.pcm.caf"));
+        std::fs::write(&src, caf_alac(&cookie, rate, channels, bits, (pcm.len() / channels) as u64, &frames)).unwrap();
+        run(Command::new(&alacconvert).arg(&src).arg(&out));
+        let got = from_alac_order(&read_caf(&std::fs::read(&out).unwrap()).pcm.expect("PCM"), channels);
+        if got != pcm {
+            eprintln!("{channels}ch seed {seed}: {}", first_mismatch(&got, &pcm));
+            bad.push((channels, seed));
+        }
+    }
+    assert!(bad.is_empty(), "Apple's decoder differs on {bad:?}");
+}
+
 /// Sizes against the reference encoders on a few synthetic signals, for
 /// the record: printed, with nothing asserted beyond beating raw PCM.
 #[test]

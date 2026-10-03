@@ -182,6 +182,14 @@ ALAC encoder at their defaults):
 | 1 kHz sine, 16-bit | 26.1% | 18.4% | 14.6% | 26.6% | 22.9% | 26.7% |
 | brown noise, 16-bit | 62.6% | 62.6% | 62.6% | 63.6% | 63.3% | 63.4% |
 
+**Known issue (ALAC encode):** on about 1 in 70 of the synthetic test
+signals, a frame this crate's encoder writes decodes differently in
+Apple's decoder than in this crate's — always a few samples after a
+stretch of silence or of a constant ends, where the residual coder has been
+coding runs of zeros. The two halves of this crate agree with each other
+there, so they share the departure from the format. The cases are kept in
+`tests/oracle.rs` as an ignored test until it is found and fixed.
+
 **Not verified here:** 20-bit ALAC against another implementation, either
 way (`alacconvert` neither writes nor reads it; the round trips cover it);
 FLAC in MP4 from another muxer (the packaged MP4 muxer that writes `dfLa`,
