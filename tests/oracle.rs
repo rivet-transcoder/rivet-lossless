@@ -426,39 +426,130 @@ fn rivet_alac_decodes_bit_exact_in_apple_alac() {
     }
 }
 
-/// Streams of this crate's encoder that Apple's decoder decodes to other
-/// PCM than this crate's decoder does — found by a sweep of the test signal
-/// over seeds 300-419 at 48 kHz, 16 bits, 1-8 channels (13 of 960). Every
-/// one differs a few samples after a stretch of digital silence or of a
-/// constant ends, where the residual coder has been coding runs of zeros;
-/// this crate's encoder and decoder agree with each other there, so the two
-/// share whatever departs from the format. Ignored until that is found and
-/// fixed: `cargo test --release --test oracle -- --ignored`.
+/// Sparse test audio: mostly digital silence broken by short bursts and
+/// isolated clicks of every size up to full scale, so the residual coder
+/// keeps entering and leaving its zero-run mode — with runs that end at the
+/// block's end, runs that end on a sample of either sign and magnitude, and
+/// runs that end on the smallest values, where the first sample after a
+/// run is coded one lower.
+fn sparse_signal(frames: usize, channels: usize, bits: u32, seed: u32) -> Vec<i32> {
+    let full = (1i64 << (bits - 1)) - 1;
+    let mut rng = seed.wrapping_mul(2_246_822_519).max(1);
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    let mut out = vec![0i32; frames * channels];
+    let mut i = 0usize;
+    while i < frames {
+        i += (next() % 600) as usize;
+        let len = (next() % 40) as usize;
+        let shift = next() % bits;
+        for j in i..(i + len).min(frames) {
+            for c in 0..channels {
+                if next() % 3 != 0 {
+                    let v = i64::from(next() as i32) >> (31 - shift.min(31));
+                    out[j * channels + c] = v.clamp(-full - 1, full) as i32;
+                }
+            }
+        }
+        i += len;
+    }
+    out
+}
+
+/// This crate's ALAC through Apple's decoder over a sweep of signals,
+/// depths and channel counts. Where this crate once departed from the
+/// format — the Rice history's update for the first sample after a run of
+/// zeros, which goes by that sample's value as it decodes, not as it is
+/// coded (one lower) — about 1 stream in 70 of the test signal decoded
+/// differently in Apple's decoder; the first seeds here are those streams.
+/// `RIVET_ALAC_SWEEP=n` widens the sweep to `n` seeds per configuration.
 #[test]
-#[ignore = "known: Apple's decoder disagrees with these streams"]
-fn rivet_alac_after_a_zero_run_decodes_bit_exact_in_apple_alac() {
+fn rivet_alac_sweep_decodes_bit_exact_in_apple_alac() {
     let Some(alacconvert) = tool("alacconvert") else {
         eprintln!("SKIP: no `alacconvert`");
         return;
     };
     let known: &[(usize, u32)] =
         &[(2, 335), (3, 327), (3, 347), (5, 371), (5, 384), (5, 388), (6, 309), (6, 381), (7, 309), (7, 320), (7, 347), (7, 396), (8, 324)];
+    let seeds: u32 = std::env::var("RIVET_ALAC_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let mut cases: Vec<(u32, usize, u32, u32, bool)> = known.iter().map(|&(c, s)| (48_000, c, 16, s, false)).collect();
+    // 20 bits through this crate's decoder alone: `alacconvert` does not
+    // decode 20-bit ALAC. The entropy coder is the same at every depth.
+    for bits in [16u32, 20, 24, 32] {
+        for channels in 1..=8usize {
+            for seed in 0..seeds {
+                let seed = 1000 + seed * 7 + channels as u32 * 131 + bits;
+                cases.push((48_000, channels, bits, seed, false));
+                cases.push((44_100, channels, bits, seed, true));
+            }
+        }
+    }
     let mut bad = Vec::new();
-    for &(channels, seed) in known {
-        let (rate, bits) = (48_000u32, 16u32);
-        let pcm = signal(rate as usize * 3 / 2 + 321, channels, bits, seed);
-        let (cookie, frames) = rivet_alac(&pcm, rate, channels as u8, bits as u8);
-        let src = scratch(&format!("z{channels}_{seed}.alac.caf"));
-        let out = scratch(&format!("z{channels}_{seed}.pcm.caf"));
-        std::fs::write(&src, caf_alac(&cookie, rate, channels, bits, (pcm.len() / channels) as u64, &frames)).unwrap();
+    for (n, &(rate, channels, bits, seed, sparse)) in cases.iter().enumerate() {
+        let frames = if sparse { 30_000 + seed as usize % 5_000 } else { rate as usize * 3 / 2 + 321 };
+        let pcm = if sparse { sparse_signal(frames, channels, bits, seed) } else { signal(frames, channels, bits, seed) };
+        let (cookie, packets) = rivet_alac(&pcm, rate, channels as u8, bits as u8);
+        let label = format!("{}{channels}ch {bits}-bit seed {seed}", if sparse { "sparse " } else { "" });
+        let track = Track { codec: "alac", config: cookie.clone(), packets: packets.iter().map(|(p, _)| p.clone()).collect() };
+        let own = decode_alac_track(&track);
+        assert!(own[..pcm.len()] == pcm[..], "{label}: own decoder: {}", first_mismatch(&own, &pcm));
+        if bits == 20 {
+            continue;
+        }
+        let src = scratch(&format!("w{n}.alac.caf"));
+        let out = scratch(&format!("w{n}.pcm.caf"));
+        std::fs::write(&src, caf_alac(&cookie, rate, channels, bits, (pcm.len() / channels) as u64, &packets)).unwrap();
         run(Command::new(&alacconvert).arg(&src).arg(&out));
         let got = from_alac_order(&read_caf(&std::fs::read(&out).unwrap()).pcm.expect("PCM"), channels);
         if got != pcm {
-            eprintln!("{channels}ch seed {seed}: {}", first_mismatch(&got, &pcm));
-            bad.push((channels, seed));
+            eprintln!("{label}: {}", first_mismatch(&got, &pcm));
+            bad.push(label);
         }
     }
+    eprintln!("{} streams, {} differ", cases.len(), bad.len());
     assert!(bad.is_empty(), "Apple's decoder differs on {bad:?}");
+}
+
+/// Apple's encoder over the same sweep (sparse signals too, so its streams
+/// enter and leave the zero-run mode), through this crate's decoder.
+#[test]
+fn apple_alac_sweep_decodes_bit_exact() {
+    let Some(alacconvert) = tool("alacconvert") else {
+        eprintln!("SKIP: no `alacconvert`");
+        return;
+    };
+    let seeds: u32 = std::env::var("RIVET_ALAC_SWEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let mut n = 0;
+    for bits in [16u32, 24, 32] {
+        for channels in 1..=8usize {
+            for seed in 0..seeds {
+                for sparse in [false, true] {
+                    let seed = 5000 + seed * 11 + channels as u32 * 37 + bits;
+                    let rate = 48_000;
+                    let pcm = if sparse {
+                        sparse_signal(30_000 + seed as usize % 5_000, channels, bits, seed)
+                    } else {
+                        signal(rate as usize + 777, channels, bits, seed)
+                    };
+                    let src = scratch(&format!("v{n}.pcm.caf"));
+                    let out = scratch(&format!("v{n}.alac.caf"));
+                    n += 1;
+                    std::fs::write(&src, caf_pcm(&to_alac_order(&pcm, channels), rate, channels, bits)).unwrap();
+                    run(Command::new(&alacconvert).arg(&src).arg(&out));
+                    let caf = read_caf(&std::fs::read(&out).unwrap());
+                    let got = decode_alac_track(&caf.alac.expect("an ALAC CAF"));
+                    let label = format!("Apple {}{channels}ch {bits}-bit seed {seed}", if sparse { "sparse " } else { "" });
+                    assert!(got.len() >= pcm.len(), "{label}: short");
+                    assert!(got[..pcm.len()] == pcm[..], "{label}: {}", first_mismatch(&got, &pcm));
+                }
+            }
+        }
+    }
+    eprintln!("{n} Apple streams decoded bit-exact");
 }
 
 /// Sizes against the reference encoders on a few synthetic signals, for

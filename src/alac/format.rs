@@ -18,7 +18,10 @@
 //! **Entropy coding.** A Rice code whose parameter follows a running mean of
 //! the coded magnitudes (`history`), with an escape to raw bits for large
 //! values and, when the mean falls low, a run-length code for a run of zero
-//! samples.
+//! samples. A run shorter than the longest run code is necessarily followed
+//! by a nonzero sample, so that sample is coded one lower; the history
+//! update takes it at its decoded value, one higher than the coded one
+//! (the clamp for large values tests the coded one).
 //!
 //! Both sides run the predictor in exact integer arithmetic; the encoder
 //! rejects (and codes some other way) a block whose arithmetic would leave
@@ -296,11 +299,14 @@ pub(crate) fn decode_residuals(
         // Even values are the non-negative residuals, odd ones the negative.
         out[i] = if v & 1 == 1 { -(((v >> 1) + 1) as i64) as i32 } else { (v >> 1) as i32 };
         i += 1;
-        sign_modifier = 0;
+        // The history follows the value as decoded: after a run of zeros
+        // that is one more than the value coded (`sign_modifier`), and
+        // the Rice parameters of the samples after it follow from that.
+        let modifier = std::mem::take(&mut sign_modifier);
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
@@ -334,11 +340,11 @@ pub(crate) fn encode_residuals(bw: &mut BitWriter, p: &RiceParams, residuals: &[
         let k = sample_k(history, p.kb);
         write_code(bw, coded, k, sample_bits);
         i += 1;
-        sign_modifier = 0;
+        let modifier = std::mem::take(&mut sign_modifier);
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
@@ -378,11 +384,11 @@ pub(crate) fn residual_bits(p: &RiceParams, residuals: &[i32], sample_bits: u32)
         let coded = v.wrapping_sub(sign_modifier);
         bits += code_bits(coded, sample_k(history, p.kb), sample_bits);
         i += 1;
-        sign_modifier = 0;
+        let modifier = std::mem::take(&mut sign_modifier);
         history = if coded > N_MAX_MEAN_CLAMP {
             N_MAX_MEAN_CLAMP
         } else {
-            history.wrapping_add(coded.wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
+            history.wrapping_add(coded.wrapping_add(modifier).wrapping_mul(p.pb)).wrapping_sub((history.wrapping_mul(p.pb)) >> QB_SHIFT)
         };
         if history < 128 && i < n {
             let k = run_k(history).min(p.kb);
