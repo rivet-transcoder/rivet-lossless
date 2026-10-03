@@ -1,6 +1,6 @@
 # rivet-lossless
 
-[![CI](https://github.com/rivet-transcoder/rivet-lossless/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-lossless/actions/workflows/ci.yml)
+[![CI](https://github.com/safewords/rivet-lossless/actions/workflows/ci.yml/badge.svg)](https://github.com/safewords/rivet-lossless/actions/workflows/ci.yml)
 
 **FLAC** and **ALAC** (Apple Lossless) encoders and decoders in Rust: no C,
 no system libraries, no build script, nothing to install on a build host.
@@ -10,7 +10,7 @@ decodes to exactly the PCM that went in, both ways, against the `flac`
 command-line tool and Apple's ALAC reference encoder and decoder
 ([below](#how-it-is-checked)).
 
-Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
+Written for the **[rivet](https://github.com/safewords/rivet)**
 transcoder, where it is the lossless codec on both sides: the encoders
 behind `audio=flac` and `audio=alac`, and the decoders that let a FLAC or
 ALAC source be downmixed, filtered or transcoded. Usable on its own by
@@ -23,7 +23,7 @@ features, no build script.
 
 ```toml
 [dependencies]
-lossless = { package = "rivet-lossless", git = "https://github.com/rivet-transcoder/rivet-lossless", branch = "develop" }
+lossless = { package = "rivet-lossless", git = "https://github.com/safewords/rivet-lossless", branch = "develop" }
 ```
 
 ## What it does
