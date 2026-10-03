@@ -7,7 +7,8 @@ no system libraries, no build script, nothing to install on a build host.
 Written from RFC 9639 and the published ALAC format description, not
 translated from any other implementation. Every stream it was checked on
 decodes to exactly the PCM that went in, both ways, against the `flac`
-command-line tool and ffmpeg ([below](#how-it-is-checked)).
+command-line tool and Apple's ALAC reference encoder and decoder
+([below](#how-it-is-checked)).
 
 Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
 transcoder, where it is the lossless codec on both sides: the encoders
@@ -105,7 +106,7 @@ is wrong.
 ## Channel order
 
 Samples go in and come out in the channel order most multichannel PCM
-pipelines use (ffmpeg's native order). FLAC's order for every count is that
+pipelines use (the WAVE channel-mask order). FLAC's order for every count is that
 order. ALAC's layouts lead with the centre channel, so the ALAC decoder and
 encoder reorder. `flac::layout(n)` and `alac::layout(n)` name the
 `Speaker`s:
@@ -133,21 +134,29 @@ less; a 32-bit sample keeps its top 24 bits.
 ## How it is checked
 
 - **Against independent implementations, as black boxes**
-  (`tests/oracle.rs`; CI installs `flac` and `ffmpeg` and sets
+  (`tests/oracle.rs`; CI installs `flac` and `mkvtoolnix`, builds
+  `alacconvert` with `tools/build-alacconvert.sh`, and sets
   `RIVET_REQUIRE_LOSSLESS_ORACLES=1`, under which a missing tool fails the
   run instead of skipping it). Synthetic PCM is encoded by the reference and
   decoded here, or encoded here and decoded by the reference; either way the
-  PCM must come back exactly.
+  PCM must come back exactly. The references: for FLAC, `flac`, the
+  Xiph.Org reference implementation's command-line tool; for ALAC,
+  `alacconvert`, built from Apple's open-source ALAC release
+  ([macosforge/alac](https://github.com/macosforge/alac), pinned), which
+  reads and writes CAF files. `FLAC`, `MKVMERGE` and `ALACCONVERT` name the
+  binaries when they are not on PATH.
   - Decode: `flac` CLI streams at `-0`, `-3`, `-5`, `-8`, `-8 -l 32`, block
     sizes 576 / 1152 / 4096, `--no-mid-side`; 8, 16, 24 and 32 bits;
-    22.05–192 kHz; 1–8 channels; the STREAMINFO MD5 checked. FLAC remuxed by
-    ffmpeg into MP4 and Matroska. ffmpeg's ALAC encoder in `.m4a` and
-    `.mkv`: 16 and 24 bits, 44.1 / 48 / 96 kHz, 1–8 channels.
-  - Encode: FLAC through `flac -t` (MD5 verified) and `flac -d`, and ffmpeg
-    on the native stream and on FLAC in MP4; all three levels; 16, 24 and
-    32 bits (32-bit through `flac` only); 22.05–192 kHz; 1, 2, 3, 6 and 8
-    channels. ALAC in `.m4a` decoded by ffmpeg: 16, 20, 24 and 32 bits;
-    44.1 / 48 / 96 kHz; 1–8 channels.
+    22.05–192 kHz; 1–8 channels; the STREAMINFO MD5 checked. FLAC muxed into
+    Matroska by `mkvmerge`, and into MP4 (`dfLa`) by the test's own writer.
+    Apple's ALAC encoder: 16, 24 and 32 bits, 22.05–192 kHz, 1–8 channels,
+    the cookie with its channel layout info as Apple writes it.
+  - Encode: FLAC through `flac -t` (MD5 verified) and `flac -d`; all three
+    levels; 8, 16, 24 and 32 bits; 22.05–192 kHz; 1, 2, 3, 5, 6, 7 and 8
+    channels. ALAC decoded by Apple's decoder: 16, 24 and 32 bits;
+    44.1–192 kHz; 1–8 channels. Apple's tool does no channel reordering,
+    so both directions also check this crate's ALAC channel order against
+    the orders Apple documents.
 - **Round trips** through this crate's own encoder and decoder at every
   depth, layout and level, and short, silent, constant, full-scale and
   noise-only inputs.
@@ -156,24 +165,30 @@ less; a 32-bit sample keeps its top 24 bits.
   every width, the Rice coder through runs and escapes, the ALAC predictor's
   inverse, Levinson-Durbin on a known AR(2) process.
 
-First run in the rivet repository against `flac` 1.4.2 and ffmpeg 5.1; run
-again at the move to this repository (2026-10-02) against `flac` 1.4.3 and
-ffmpeg 8.1.1, every case passing.
+First run in the rivet repository against `flac` 1.4.2 and ffmpeg 5.1, and
+at the move to this repository (2026-10-02) against `flac` 1.4.3 and
+ffmpeg 8.1.1. Since 2026-10-03 the references are `flac` 1.4.3, MKVToolNix
+82 and Apple's `alacconvert` (macosforge/alac `c38887c`), every case
+passing; ffmpeg is no longer used.
 
 **Size against the reference encoders** (10 s of stereo at 44.1 kHz, % of
-the raw PCM; `flac -5` and ffmpeg's ALAC encoder at their defaults):
+the raw PCM, the ALAC columns counting packets only; `flac -5` and Apple's
+ALAC encoder at their defaults):
 
-| Signal | FLAC `Fast` | `Default` | `Best` | `flac -5` | ALAC | ffmpeg ALAC |
+| Signal | FLAC `Fast` | `Default` | `Best` | `flac -5` | ALAC | Apple ALAC |
 |---|---|---|---|---|---|---|
-| tones + noise, 16-bit | 69.8% | 68.7% | 68.4% | 69.2% | 68.9% | 69.0% |
-| tones + noise, 24-bit | 79.3% | 78.5% | 78.3% | 78.9% | 79.0% | 79.3% |
-| 1 kHz sine, 16-bit | 26.1% | 18.4% | 14.6% | 26.6% | 22.9% | 38.1% |
-| brown noise, 16-bit | 62.6% | 62.6% | 62.6% | 63.6% | 63.4% | 63.5% |
+| tones + noise, 16-bit | 69.8% | 68.7% | 68.4% | 69.2% | 68.8% | 69.0% |
+| tones + noise, 24-bit | 79.3% | 78.5% | 78.3% | 78.9% | 78.9% | 79.4% |
+| 1 kHz sine, 16-bit | 26.1% | 18.4% | 14.6% | 26.6% | 22.9% | 26.7% |
+| brown noise, 16-bit | 62.6% | 62.6% | 62.6% | 63.6% | 63.3% | 63.4% |
 
-**Not verified here:** decoding ALAC at 20 or 32 bits from an encoder other
-than this one (ffmpeg's ALAC encoder writes only 16 and 24); FLAC streams
-with variable block sizes from another encoder (neither reference writes
-them; the decoder handles the flag and the sample-numbered header).
+**Not verified here:** 20-bit ALAC against another implementation, either
+way (`alacconvert` neither writes nor reads it; the round trips cover it);
+FLAC in MP4 from another muxer (the packaged MP4 muxer that writes `dfLa`,
+GPAC's MP4Box, links FFmpeg's libraries; the test wraps `flac`'s frames
+itself); FLAC streams with variable
+block sizes from another encoder (`flac` does not write them; the decoder
+handles the flag and the sample-numbered header).
 
 ## Provenance and licensing
 
@@ -191,9 +206,11 @@ Written from:
 
 **No implementation's source was consulted** — not libFLAC, not FFmpeg's
 FLAC or ALAC codecs, not Apple's ALAC reference code, not claxon, symphonia
-or any other decoder or encoder. The `flac` command-line tool and ffmpeg
-were used only as black boxes: to make test streams, and to decode this
-crate's output so it could be compared with the source PCM. The code was
+or any other decoder or encoder. The `flac` command-line tool, `mkvmerge`
+and Apple's `alacconvert` (built from its release, never read) are used
+only as black boxes: to make test streams, and to decode this crate's
+output so it could be compared with the source PCM. ffmpeg served the same
+black-box role until 2026-10-03 and is no longer used. The code was
 written in the rivet repository first and moved here with its history.
 
 **Patents.** FLAC is an open format (RFC 9639), and Apple published ALAC

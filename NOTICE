@@ -20,9 +20,11 @@ Golomb coding. They are not translations of, and do not derive from, any
 other implementation's source: not libFLAC, not FFmpeg's FLAC or ALAC
 codecs, not Apple's ALAC reference code, not claxon or symphonia.
 
-Both codecs are verified against the `flac` command-line tool and ffmpeg,
-used only as black boxes (command-line tools whose output streams and PCM
-are compared); none of their code is included or was consulted.
+Both codecs are verified against reference implementations used only as
+black boxes (command-line tools whose output streams and PCM are compared):
+the `flac` command-line tool for FLAC, with MKVToolNix's `mkvmerge` to
+wrap its streams, and `alacconvert`, built from Apple's open-source ALAC
+release, for ALAC. None of their code is included or was consulted.
 
 ------------------------------------------------------------------------------
 Patents
